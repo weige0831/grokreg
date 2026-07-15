@@ -14,10 +14,6 @@ on:
         description: "true=headless; false=headed (default)"
         required: false
         default: "false"
-      max_parallel:
-        description: "Max concurrent child jobs (default 20, min 1)"
-        required: false
-        default: "20"
 
 jobs:
   prepare:
@@ -54,7 +50,7 @@ jobs:
     needs: prepare
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJSON(inputs.max_parallel || '20') }}
+      # no max-parallel: GitHub queues by org/account concurrency automatically
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     uses: ./.github/workflows/register_windows.yml
     with:
