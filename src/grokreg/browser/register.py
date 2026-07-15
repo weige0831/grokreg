@@ -452,90 +452,176 @@ return 'clicked';
         raise BrowserRegisterError("code fill/submit failed")
 
     def fill_profile(self) -> dict[str, str]:
-        page = self.page
-        first, last = _rand_name()
-        password = _rand_password()
-        month, day, year = _rand_birthday()
+        """Sample fill_profile_and_submit: fill names/password, wait CF, then submit."""
+        import json as _json
 
-        # JS-first like sample (data-testid fields)
-        ok = self._js(
-            r"""
-const given = arguments[0], family = arguments[1], password = arguments[2];
-const month = arguments[3], day = arguments[4], year = arguments[5];
-function isVisible(node) {
-  if (!node) return false;
-  const style = window.getComputedStyle(node);
-  if (style.display === 'none' || style.visibility === 'hidden') return false;
-  const rect = node.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-}
-function setVal(selList, value) {
-  for (const sel of selList) {
-    const el = Array.from(document.querySelectorAll(sel)).find(isVisible);
-    if (!el) continue;
-    el.focus();
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
-      || Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
-    if (setter) setter.call(el, value); else el.value = value;
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    return true;
-  }
-  return false;
-}
-const g = setVal(['input[data-testid="givenName"]','input[name="givenName"]','input[autocomplete="given-name"]','input[name="given_name"]'], given);
-const f = setVal(['input[data-testid="familyName"]','input[name="familyName"]','input[autocomplete="family-name"]','input[name="family_name"]'], family);
-const p = setVal(['input[data-testid="password"]','input[name="password"]','input[type="password"]','input[autocomplete="new-password"]'], password);
-setVal(['select[name="month"]','input[name="month"]','select[data-testid="month"]'], month);
-setVal(['select[name="day"]','input[name="day"]','select[data-testid="day"]'], day);
-setVal(['select[name="year"]','input[name="year"]','select[data-testid="year"]'], year);
-return {g,f,p};
-""",
-            first,
-            last,
-            password,
-            month,
-            day,
-            year,
-        )
-        self.log(f"[reg] profile fill={ok}")
-        self._sleep(0.5)
-        self._js(
-            r"""
-function isVisible(node) {
-  if (!node) return false;
-  const style = window.getComputedStyle(node);
-  if (style.display === 'none' || style.visibility === 'hidden') return false;
-  const rect = node.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-}
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter(
-  n => isVisible(n) && !n.disabled
-);
-const btn = buttons.find((node) => {
-  const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
-  return t.includes('signup') || t.includes('sign up') || t.includes('create') ||
-         t.includes('continue') || t.includes('注册') || t.includes('完成') || t.includes('next');
-}) || buttons[0];
-if (btn) { btn.click(); return true; }
-return false;
+        first, last = _rand_name()
+        password = "N" + "".join(random.choices(string.hexdigits.lower(), k=8)) + "!a7#" + _rand_password(8)
+        deadline = time.time() + float(self.cfg.get("profile_timeout") or 180)
+        form_filled = False
+        wait_cf_since = 0.0
+        self.log("[reg] preheat turnstile…")
+        self._sleep(2)
+
+        while time.time() < deadline:
+            if not form_filled:
+                g, f, p = _json.dumps(first), _json.dumps(last), _json.dumps(password)
+                filled = self._js(
+                    f"""
+const givenName = {g};
+const familyName = {f};
+const password = {p};
+function isVisible(node) {{
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}}
+function pickInput(selector) {{
+    return Array.from(document.querySelectorAll(selector)).find((node) => isVisible(node) && !node.disabled && !node.readOnly) || null;
+}}
+function setInputValue(input, value) {{
+    if (!input) return false;
+    input.focus(); input.click();
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    const tracker = input._valueTracker;
+    if (tracker) tracker.setValue('');
+    if (nativeSetter) nativeSetter.call(input, value); else input.value = value;
+    input.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: value, inputType: 'insertText' }}));
+    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+    input.blur();
+    return String(input.value || '').trim() === String(value || '').trim();
+}}
+const givenInput = pickInput('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"], input[name="given_name"]');
+const familyInput = pickInput('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"], input[name="family_name"]');
+const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"], input[autocomplete="new-password"]');
+if (!givenInput || !familyInput || !passwordInput) return 'not-ready';
+const ok1 = setInputValue(givenInput, givenName);
+const ok2 = setInputValue(familyInput, familyName);
+const ok3 = setInputValue(passwordInput, password);
+if (!ok1 || !ok2 || !ok3) return 'fill-failed';
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+const cfPresent = !!cfInput || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
+if (cfPresent) {{
+  const token = String((cfInput && cfInput.value) || '').trim();
+  if (token.length < 80) return 'wait-cloudflare:' + token.length;
+}}
+return 'ready-to-submit';
 """
-        )
-        self._sleep(3)
-        return {
-            "given_name": first,
-            "family_name": last,
-            "password": password,
-            "birthday": f"{year}-{month}-{day}",
-        }
+                )
+                self.log(f"[reg] profile fill state={filled}")
+                if filled == "not-ready" or filled == "fill-failed":
+                    self._sleep(0.6)
+                    continue
+                if isinstance(filled, str) and filled.startswith("wait-cloudflare"):
+                    form_filled = True
+                    if not wait_cf_since:
+                        wait_cf_since = time.time()
+                    self._sleep(1)
+                    continue
+                if filled in ("ready-to-submit", "filled-no-submit"):
+                    form_filled = True
+
+            submit_state = self._js(
+                r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+const cfPresent = !!cfInput
+  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
+if (cfPresent) {
+    const token = String((cfInput && cfInput.value) || '').trim();
+    if (token.length < 80) return 'wait-cloudflare:' + token.length;
+}
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
+    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+});
+const submitBtn = buttons.find((node) => {
+    const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
+    return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') ||
+           t.includes('sign up') || t.includes('createaccount') || t.includes('create') || t.includes('注册');
+});
+if (!submitBtn) return 'no-submit-button';
+submitBtn.focus();
+submitBtn.click();
+return 'submitted';
+"""
+            )
+            self.log(f"[reg] profile submit={submit_state}")
+            if isinstance(submit_state, str) and submit_state.startswith("wait-cloudflare"):
+                self._sleep(1)
+                continue
+            if submit_state == "submitted":
+                self._sleep(2)
+                return {"given_name": first, "family_name": last, "password": password}
+            self._sleep(0.6)
+        raise BrowserRegisterError("profile fill/submit failed (turnstile or form)")
 
     def wait_sso(self, timeout: float | None = None) -> str:
-        timeout = float(timeout if timeout is not None else self.cfg.get("sso_timeout") or self.cfg.get("sso_timeout_base") or 240)
+        timeout = float(
+            timeout
+            if timeout is not None
+            else self.cfg.get("sso_timeout") or self.cfg.get("sso_timeout_base") or 240
+        )
         deadline = time.time() + timeout
+        last_submit = 0.0
         self.log("[reg] wait sso cookie")
         while time.time() < deadline:
+            now = time.time()
+            # sample: if still on final signup page, re-click submit after CF
+            if now - last_submit >= 2.5:
+                retried = self._js(
+                    r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+const titleHit = !!Array.from(document.querySelectorAll('h1,h2,div,span')).find((el) => {
+    const t = (el.textContent || '').replace(/\s+/g, '');
+    return t.includes('完成注册') || t.toLowerCase().includes('complete') || t.toLowerCase().includes('create your');
+});
+if (!titleHit) return 'not-final-page';
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+const cfPresent = !!cfInput
+  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
+if (cfPresent) {
+    const token = String((cfInput && cfInput.value) || '').trim();
+    if (token.length < 80) return 'final-page-wait-cf:' + token.length;
+}
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
+    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+});
+const submitBtn = buttons.find((node) => {
+    const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
+    return t.includes('完成注册') || t.includes('创建账户') || t.includes('sign up') ||
+           t.includes('signup') || t.includes('createaccount') || t.includes('create') || t.includes('注册');
+});
+if (!submitBtn) return 'final-page-no-submit';
+submitBtn.focus();
+submitBtn.click();
+return 'final-page-clicked-submit';
+"""
+                )
+                last_submit = now
+                if retried and retried != "not-final-page":
+                    self.log(f"[reg] final page: {retried}")
+
             try:
                 cookies = self.page.cookies()
+                try:
+                    # sample uses all_domains when available
+                    cookies = self.page.cookies(all_domains=True) or cookies
+                except Exception:
+                    pass
             except Exception:
                 cookies = []
             for c in cookies or []:
@@ -565,7 +651,7 @@ return false;
             except Exception:
                 pass
             self._handle_turnstile_hint()
-            self._sleep(2)
+            self._sleep(1.2)
         raise BrowserRegisterError("sso timeout")
 
     def _handle_turnstile_hint(self) -> None:
