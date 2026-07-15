@@ -156,6 +156,7 @@ class TempMailClient:
         deadline = time.time() + (timeout if timeout is not None else self.timeout)
         seen: set[str] = set()
         last_log = 0.0
+        started = time.time()
         while time.time() < deadline:
             try:
                 emails = self.list_emails(token)
@@ -165,7 +166,10 @@ class TempMailClient:
                 continue
             now = time.time()
             if now - last_log >= 15:
-                self.log(f"[mail] polling… inbox={len(emails)} left={int(deadline - now)}s")
+                self.log(
+                    f"[mail] polling… inbox={len(emails)} left={int(deadline - now)}s "
+                    f"elapsed={int(now - started)}s proxy={bool(self.proxy)}"
+                )
                 last_log = now
             for item in emails:
                 eid = str(item.get("id") or item.get("_id") or item.get("message_id") or "")

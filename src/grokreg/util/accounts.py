@@ -17,8 +17,8 @@ def parse_accounts_file(path: str | Path) -> list[AccountLine]:
     if not p.exists():
         return []
     out: list[AccountLine] = []
-    for line in p.read_text(encoding="utf-8").splitlines():
-        raw = line.strip()
+    for line in p.read_text(encoding="utf-8-sig").splitlines():
+        raw = line.strip().lstrip("\ufeff")
         if not raw or raw.startswith("#"):
             continue
         parts = raw.split("----")

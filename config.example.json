@@ -36,7 +36,7 @@
   "probe_endpoint": "chat/completions",
   "probe_fail_status_codes": [400, 401, 402, 403, 429, 439, 500, 502, 503],
 
-  "grok2api_auto_add_remote": true,
+  "grok2api_auto_add_remote": false,
   "grok2api_remote_base": "",
   "grok2api_remote_app_key": "",
   "grok2api_pool_name": "Build",

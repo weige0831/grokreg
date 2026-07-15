@@ -179,7 +179,7 @@ def upload_from_config(
     force: bool = False,
 ) -> dict[str, Any]:
     log = log or default_log
-    if not cfg.get("grok2api_auto_add_remote", True) and not force:
+    if not cfg.get("grok2api_auto_add_remote", False) and not force:
         return {"ok": False, "code": "upload_skipped", "error": "auto_add_remote disabled"}
     base = str(cfg.get("grok2api_remote_base") or "").strip()
     app_key = str(cfg.get("grok2api_remote_app_key") or "").strip()

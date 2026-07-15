@@ -11,6 +11,15 @@ results*.jsonl
 importable.json
 importable.jsonl
 cpa_auths/
+g2a_auth/
+diag/
+export_*.jsonl
+export_*.txt
+g2a_*.txt
+retest_*.py
+retest_*.json
+results_probe_retest.json
+unusable.jsonl
 *.log
 .DS_Store
 auth_out/

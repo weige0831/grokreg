@@ -39,9 +39,6 @@ jobs:
       - name: Write config from secrets
         env:
           PROXY_URL: ${{ secrets.PROXY_URL }}
-          GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
-          GROK2API_APP_KEY: ${{ secrets.GROK2API_APP_KEY }}
-          GROK2API_POOL: ${{ secrets.GROK2API_POOL }}
           TEMPMAIL_BASE_URL: ${{ secrets.TEMPMAIL_BASE_URL }}
           HEADLESS: ${{ inputs.headless }}
         run: |
@@ -49,32 +46,29 @@ jobs:
           import json, os
           cfg = json.load(open("config.example.json", encoding="utf-8"))
           cfg["proxy"] = os.environ.get("PROXY_URL") or ""
-          cfg["grok2api_remote_base"] = os.environ.get("GROK2API_REMOTE_BASE") or ""
-          cfg["grok2api_remote_app_key"] = os.environ.get("GROK2API_APP_KEY") or ""
-          pool = os.environ.get("GROK2API_POOL") or "Build"
-          cfg["grok2api_pool_name"] = pool
-          if pool.lower() == "build":
-              cfg["grok2api_pool_api_value"] = "build"
           if os.environ.get("TEMPMAIL_BASE_URL"):
               cfg["tempmail_base_url"] = os.environ["TEMPMAIL_BASE_URL"]
           cfg["headless"] = (os.environ.get("HEADLESS") or "false").lower() == "true"
-          cfg["register_count"] = int("${{ inputs.count }}" or "1")
-          # common chromium paths on ubuntu
+          # force single account; do NOT auto-upload to grok2api
+          cfg["register_count"] = 1
+          cfg["grok2api_auto_add_remote"] = False
+          cfg["grok2api_remote_base"] = ""
+          cfg["grok2api_remote_app_key"] = ""
+          cfg["browser_engine"] = "drission"
+          cfg["browser_build_authorize"] = True
           for p in ("/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome"):
               if os.path.exists(p):
                   cfg["browser_path"] = p
                   break
           json.dump(cfg, open("config.json", "w", encoding="utf-8"), indent=2)
-          print("config written (secrets redacted)")
+          print("config written: count=1 auto_add_remote=false")
           PY
 
       - name: Run register pipeline
         env:
           PROXY_URL: ${{ secrets.PROXY_URL }}
-          GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
-          GROK2API_APP_KEY: ${{ secrets.GROK2API_APP_KEY }}
         run: |
-          xvfb-run -a uv run python -m grokreg run --count ${{ inputs.count }}
+          xvfb-run -a uv run python -m grokreg run --count 1
 
       - name: Job summary
         if: always()

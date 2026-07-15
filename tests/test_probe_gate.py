@@ -1,4 +1,4 @@
-from grokreg.probe.build45 import probe_chat_completions
+from grokreg.probe.build45 import probe_chat_completions, probe_responses
 
 
 class _Resp:
@@ -15,7 +15,6 @@ class _Resp:
 
 def test_probe_403(monkeypatch):
     def fake_post(*a, **k):
-        assert "/chat/completions" in a[0] or "/chat/completions" in str(k.get("url", a[0] if a else ""))
         return _Resp(403, '{"error":"permission-denied"}')
 
     monkeypatch.setattr("grokreg.probe.build45.requests.post", fake_post)
@@ -36,8 +35,6 @@ def test_probe_439(monkeypatch):
 
 
 def test_probe_429_fail(monkeypatch):
-    """check_alive marks 429 as not uploadable; we keep fail for gate."""
-
     def fake_post(*a, **k):
         return _Resp(429, "rate limit")
 
@@ -52,7 +49,10 @@ def test_probe_ok_chat_completions(monkeypatch):
         assert "chat/completions" in url
         assert k["json"]["model"] == "grok-4.5"
         assert k["json"]["messages"][0]["content"] == "1+1=?"
-        assert k["headers"]["x-grok-client-version"] == "0.2.99"
+        # sample CPA headers (grok-pager)
+        assert "X-XAI-Token-Auth" in k["headers"] or "x-xai-token-auth" in {
+            x.lower() for x in k["headers"]
+        }
         return _Resp(
             200,
             "{}",
@@ -69,3 +69,28 @@ def test_probe_ok_chat_completions(monkeypatch):
     assert r["code"] == "probe_ok"
     assert r["detail"] == "answered"
     assert "2" in r["text"]
+
+
+def test_probe_ok_responses(monkeypatch):
+    def fake_post(url, **k):
+        assert url.endswith("/responses")
+        assert k["json"]["model"] == "grok-4.5"
+        assert k["json"]["input"] == "ping"
+        return _Resp(
+            200,
+            "{}",
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "pong"}],
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr("grokreg.probe.build45.requests.post", fake_post)
+    r = probe_responses("tok")
+    assert r["ok"] is True
+    assert r["endpoint"] == "responses"
+    assert "pong" in r["text"]

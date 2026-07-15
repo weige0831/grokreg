@@ -1,24 +1,21 @@
-name: register-probe-only
+name: register-one-to-scheduler
 
-# Register + Build 4.5 probe only. Does NOT upload to grok2api.
-# Artifacts: accounts.txt, results.jsonl, importable.jsonl (scheduler-ready JSON lines)
+# Single-account register → web → Build probe.
+# Does NOT upload to grok2api.
+# On probe_ok: POST to scheduler frontend stock + upload g2a JSON artifact.
 
 on:
   workflow_dispatch:
     inputs:
-      count:
-        description: "How many accounts to register"
-        required: true
-        default: "1"
       headless:
-        description: "true=Chromium --headless; false=headed under Xvfb (recommended for x.ai)"
+        description: "true=Chromium --headless; false=headed under Xvfb (recommended)"
         required: false
         default: "false"
 
 jobs:
-  register-probe:
+  register-one:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -39,7 +36,7 @@ jobs:
       - name: Install project
         run: uv sync
 
-      - name: Write config (no upload)
+      - name: Write config (single account, no grok2api upload)
         env:
           PROXY_URL: ${{ secrets.PROXY_URL }}
           TEMPMAIL_BASE_URL: ${{ secrets.TEMPMAIL_BASE_URL }}
@@ -51,34 +48,36 @@ jobs:
           cfg["proxy"] = os.environ.get("PROXY_URL") or ""
           if os.environ.get("TEMPMAIL_BASE_URL"):
               cfg["tempmail_base_url"] = os.environ["TEMPMAIL_BASE_URL"]
-          # sample prefers headed browser; under GHA use Xvfb + headless=false
           cfg["headless"] = (os.environ.get("HEADLESS") or "false").lower() == "true"
-          cfg["register_count"] = int("${{ inputs.count }}" or "1")
-          # critical: do not upload to grok2api
+          cfg["register_count"] = 1
+          # never auto-push to grok2api from GHA
           cfg["grok2api_auto_add_remote"] = False
           cfg["grok2api_remote_base"] = ""
           cfg["grok2api_remote_app_key"] = ""
+          cfg["browser_engine"] = "drission"
+          cfg["browser_build_authorize"] = True
+          cfg["require_web_before_build"] = True
+          cfg["post_register_cloak"] = False
           for p in ("/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome"):
               if os.path.exists(p):
                   cfg["browser_path"] = p
                   break
           json.dump(cfg, open("config.json", "w", encoding="utf-8"), indent=2)
-          print("config written: auto_add_remote=false proxy=%s" % bool(cfg["proxy"]))
+          print("config: count=1 auto_add_remote=false proxy=%s" % bool(cfg["proxy"]))
           PY
 
-      - name: Run register + probe (no upload)
+      - name: Run register + probe (one account)
         env:
           PROXY_URL: ${{ secrets.PROXY_URL }}
         run: |
-          xvfb-run -a uv run python -m grokreg run --count ${{ inputs.count }}
+          xvfb-run -a uv run python -m grokreg run --count 1
 
-      - name: Build importable JSON for scheduler
+      - name: Build importable + g2a auth JSON
         if: always()
         run: |
           python - <<'PY'
-          import json, pathlib
+          import json, pathlib, shutil
 
-          # pipeline writes importable.jsonl with full sso + tokens on probe_ok
           side = pathlib.Path("importable.jsonl")
           lines_out = []
           if side.exists():
@@ -90,14 +89,15 @@ jobs:
                       it = json.loads(line)
                   except Exception:
                       continue
-                  it.setdefault("source", "gha-register-probe-only")
-                  tags = it.get("tags") or []
-                  if "no-upload" not in tags:
-                      tags = list(tags) + ["no-upload"]
+                  it.setdefault("source", "gha-register-one")
+                  tags = list(it.get("tags") or [])
+                  for t in ("no-upload", "gha"):
+                      if t not in tags:
+                          tags.append(t)
                   it["tags"] = tags
                   lines_out.append(it)
 
-          # fallback: accounts.txt only (sso present, tokens may be empty)
+          # fallback accounts.txt + results
           if not lines_out:
               accounts = pathlib.Path("accounts.txt")
               results = pathlib.Path("results.jsonl")
@@ -127,10 +127,11 @@ jobs:
                           "sso": sso,
                           "access_token": "",
                           "refresh_token": "",
-                          "source": "gha-register-probe-only",
+                          "id_token": "",
+                          "source": "gha-register-one",
                           "probe_status": 200,
                           "probe_detail": "probe_ok",
-                          "tags": ["probe-ok", "no-upload"],
+                          "tags": ["probe-ok", "no-upload", "gha"],
                       })
 
           pathlib.Path("importable.json").write_text(
@@ -139,10 +140,131 @@ jobs:
           with side.open("w", encoding="utf-8") as f:
               for it in lines_out:
                   f.write(json.dumps(it, ensure_ascii=False) + "\n")
-          print(f"importable accounts: {len(lines_out)}")
+
+          # ensure g2a_auth/*.json from importable tokens
+          g2a_dir = pathlib.Path("g2a_auth")
+          g2a_dir.mkdir(exist_ok=True)
+          n_g2a = 0
           for it in lines_out:
               at = it.get("access_token") or ""
-              print(f"  - {it.get('email')} access={'yes' if at else 'no'} sso_len={len(it.get('sso') or '')}")
+              if not at:
+                  continue
+              email = it.get("email") or "unknown"
+              safe = email.replace("@", "_").replace("/", "_")
+              path = g2a_dir / f"xai-{safe}.json"
+              if path.exists():
+                  n_g2a += 1
+                  continue
+              # minimal CPA record if pipeline did not write one
+              rec = {
+                  "type": "xai",
+                  "auth_kind": "oauth",
+                  "email": email,
+                  "sub": "",
+                  "access_token": at,
+                  "refresh_token": it.get("refresh_token") or "",
+                  "id_token": it.get("id_token") or "",
+                  "token_type": "Bearer",
+                  "expires_in": None,
+                  "expired": "",
+                  "last_refresh": "",
+                  "redirect_uri": "http://127.0.0.1:56121/callback",
+                  "token_endpoint": "https://auth.x.ai/oauth2/token",
+                  "base_url": "https://cli-chat-proxy.grok.com/v1",
+                  "disabled": False,
+                  "headers": {
+                      "User-Agent": "grok-pager/0.2.93 grok-shell/0.2.93 (linux; x86_64)",
+                      "X-XAI-Token-Auth": "xai-grok-cli",
+                      "x-authenticateresponse": "authenticate-response",
+                      "x-grok-client-identifier": "grok-pager",
+                      "x-grok-client-version": "0.2.93",
+                  },
+                  "sso": it.get("sso") or "",
+              }
+              path.write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+              n_g2a += 1
+
+          print(f"importable={len(lines_out)} g2a_auth={n_g2a}")
+          for it in lines_out:
+              print(f"  - {it.get('email')} access={'yes' if it.get('access_token') else 'no'}")
+          PY
+
+      - name: Upload success account to scheduler frontend
+        if: always()
+        env:
+          SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
+          SCHEDULER_USER: ${{ secrets.SCHEDULER_USER }}
+          SCHEDULER_PASS: ${{ secrets.SCHEDULER_PASS }}
+          SCHEDULER_TOKEN: ${{ secrets.SCHEDULER_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, sys, urllib.error, urllib.request
+
+          base = (os.environ.get("SCHEDULER_URL") or "").rstrip("/")
+          if not base:
+              print("SCHEDULER_URL not set — skip frontend upload")
+              sys.exit(0)
+
+          imp = pathlib.Path("importable.json")
+          if not imp.exists():
+              print("no importable.json — skip")
+              sys.exit(0)
+          accounts = json.loads(imp.read_text(encoding="utf-8"))
+          if not accounts:
+              print("importable empty (probe not ok) — skip frontend upload")
+              sys.exit(0)
+
+          def req(method, url, data=None, token=""):
+              body = None if data is None else json.dumps(data).encode("utf-8")
+              headers = {"Content-Type": "application/json", "Accept": "application/json"}
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+              r = urllib.request.Request(url, data=body, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(r, timeout=60) as resp:
+                      raw = resp.read().decode("utf-8", errors="replace")
+                      return resp.status, json.loads(raw) if raw else {}
+              except urllib.error.HTTPError as e:
+                  raw = e.read().decode("utf-8", errors="replace")
+                  try:
+                      j = json.loads(raw) if raw else {}
+                  except Exception:
+                      j = {"raw": raw[:300]}
+                  return e.code, j
+
+          token = (os.environ.get("SCHEDULER_TOKEN") or "").strip()
+          if not token:
+              user = os.environ.get("SCHEDULER_USER") or "admin"
+              pwd = os.environ.get("SCHEDULER_PASS") or ""
+              if not pwd:
+                  print("need SCHEDULER_TOKEN or SCHEDULER_USER/PASS — skip")
+                  sys.exit(1)
+              code, login = req("POST", f"{base}/api/auth/login", {"username": user, "password": pwd})
+              if code != 200 or not login.get("token"):
+                  print(f"login failed status={code} body={login}")
+                  sys.exit(1)
+              token = login["token"]
+              print("scheduler login ok")
+
+          payload = {"accounts": []}
+          for a in accounts:
+              payload["accounts"].append({
+                  "email": a.get("email") or "",
+                  "password": a.get("password") or "",
+                  "sso": a.get("sso") or "",
+                  "access_token": a.get("access_token") or "",
+                  "refresh_token": a.get("refresh_token") or "",
+                  "id_token": a.get("id_token") or "",
+                  "probe_status": int(a.get("probe_status") or 200),
+                  "probe_detail": a.get("probe_detail") or "probe_ok",
+                  "tags": a.get("tags") or ["probe-ok", "gha"],
+                  "source": a.get("source") or "gha-register-one",
+              })
+          code, res = req("POST", f"{base}/api/accounts/import", payload, token=token)
+          print(f"import status={code} result={res}")
+          if code != 200:
+              sys.exit(1)
+          print("uploaded to scheduler frontend OK")
           PY
 
       - name: Job summary
@@ -159,24 +281,27 @@ jobs:
                   except Exception:
                       pass
           total = len(lines)
-          probe_ok = sum(1 for r in lines if r.get("status") == "probe_ok")
+          probe_ok = sum(1 for r in lines if r.get("status") in ("probe_ok", "upload_ok", "upload_fail"))
           reg_fail = sum(1 for r in lines if r.get("status") == "reg_fail")
           probe_fail = sum(1 for r in lines if r.get("status") == "probe_fail")
-          imp = pathlib.Path("importable.json")
           n_imp = 0
+          imp = pathlib.Path("importable.json")
           if imp.exists():
               try:
                   n_imp = len(json.loads(imp.read_text(encoding="utf-8")))
               except Exception:
                   n_imp = 0
+          n_g2a = len(list(pathlib.Path("g2a_auth").glob("*.json"))) if pathlib.Path("g2a_auth").exists() else 0
           md = (
-              "## register-probe-only\n"
-              f"- total: {total}\n"
+              "## register-one-to-scheduler\n"
+              f"- total: {total} (fixed count=1)\n"
               f"- probe_ok: {probe_ok}\n"
               f"- probe_fail: {probe_fail}\n"
               f"- reg_fail: {reg_fail}\n"
               f"- importable: {n_imp}\n"
-              "- upload: **disabled**\n"
+              f"- g2a_auth files: {n_g2a}\n"
+              "- grok2api auto upload: **disabled**\n"
+              "- scheduler frontend: via secrets SCHEDULER_URL (+ TOKEN or USER/PASS)\n"
           )
           summary = os.environ.get("GITHUB_STEP_SUMMARY")
           if summary:
@@ -188,10 +313,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: register-probe-only
+          name: register-one-${{ github.run_id }}
           path: |
             results.jsonl
             accounts.txt
             importable.json
             importable.jsonl
+            g2a_auth/
           if-no-files-found: warn
