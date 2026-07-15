@@ -7,17 +7,17 @@ on:
   workflow_dispatch:
     inputs:
       count:
-        description: "How many parallel single-account jobs (1-20)"
+        description: "How many single-account child jobs (default 256, min 1)"
         required: true
-        default: "3"
+        default: "256"
       headless:
         description: "true=headless; false=headed (default)"
         required: false
         default: "false"
       max_parallel:
-        description: "Max concurrent child jobs (1-10)"
+        description: "Max concurrent child jobs (default 20, min 1)"
         required: false
-        default: "5"
+        default: "20"
 
 jobs:
   prepare:
@@ -33,12 +33,13 @@ jobs:
         run: |
           python <<'PY'
           import json, os
-          raw = (os.environ.get("COUNT") or "1").strip()
+          raw = (os.environ.get("COUNT") or "256").strip()
           try:
               n = int(raw)
           except Exception:
-              n = 1
-          n = max(1, min(20, n))
+              n = 256
+          # no hard upper cap — user-defined; floor at 1
+          n = max(1, n)
           matrix = {"include": [{"slot": str(i)} for i in range(1, n + 1)]}
           # GITHUB_OUTPUT
           out = os.environ["GITHUB_OUTPUT"]
@@ -53,7 +54,7 @@ jobs:
     needs: prepare
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJSON(inputs.max_parallel || '5') }}
+      max-parallel: ${{ fromJSON(inputs.max_parallel || '20') }}
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     uses: ./.github/workflows/register_windows.yml
     with:
