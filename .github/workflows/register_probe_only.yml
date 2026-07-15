@@ -11,9 +11,9 @@ on:
         required: true
         default: "1"
       headless:
-        description: "Run Chromium headless"
+        description: "true=Chromium --headless; false=headed under Xvfb (recommended for x.ai)"
         required: false
-        default: "true"
+        default: "false"
 
 jobs:
   register-probe:
@@ -51,7 +51,8 @@ jobs:
           cfg["proxy"] = os.environ.get("PROXY_URL") or ""
           if os.environ.get("TEMPMAIL_BASE_URL"):
               cfg["tempmail_base_url"] = os.environ["TEMPMAIL_BASE_URL"]
-          cfg["headless"] = (os.environ.get("HEADLESS") or "true").lower() == "true"
+          # sample prefers headed browser; under GHA use Xvfb + headless=false
+          cfg["headless"] = (os.environ.get("HEADLESS") or "false").lower() == "true"
           cfg["register_count"] = int("${{ inputs.count }}" or "1")
           # critical: do not upload to grok2api
           cfg["grok2api_auto_add_remote"] = False

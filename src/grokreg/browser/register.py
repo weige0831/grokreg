@@ -164,8 +164,28 @@ class BrowserRegistrar:
         self._click_email_signup()
 
     def _click_email_signup(self) -> None:
-        deadline = time.time() + float(self.cfg.get("nav_email_button_timeout") or 12)
+        # sample click_email_signup_button — broad match including bare "email"
+        deadline = time.time() + float(self.cfg.get("nav_email_button_timeout") or 15)
         while time.time() < deadline:
+            # already on email form?
+            ready = self._js(
+                r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+const input = Array.from(document.querySelectorAll(
+  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+)).find((node) => isVisible(node) && !node.disabled);
+return !!input;
+"""
+            )
+            if ready:
+                self.log("[reg] email form already visible")
+                return
             clicked = self._js(
                 r"""
 const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
@@ -177,7 +197,7 @@ const target = candidates.find((node) => {
         text.includes('使用邮箱') ||
         lower.includes('signupwithemail') ||
         lower.includes('continuewithemail') ||
-        (lower.includes('email') && (lower.includes('sign') || lower.includes('continue') || lower.includes('register')))
+        lower.includes('email')
     );
 });
 if (!target) return false;
@@ -187,28 +207,32 @@ return true;
             )
             if clicked:
                 self.log("[reg] clicked email signup")
-                self._sleep(1.5)
+                self._sleep(2)
                 return
-            self._sleep(0.8)
-        # soft-fail: maybe already on email form
+            self._sleep(1)
         self.log("[reg] email signup button not found (maybe already on form)")
 
     def fill_email(self, email: str) -> None:
-        """JS fill aligned with sample fill_email_and_submit."""
-        deadline = time.time() + float(self.cfg.get("email_form_timeout") or 20)
+        """JS fill aligned with sample fill_email_and_submit (+ DrissionPage ele fallback)."""
+        deadline = time.time() + float(self.cfg.get("email_form_timeout") or 30)
+        last_status = ""
         while time.time() < deadline:
+            # Prefer sample-style JS with explicit string embed (avoid arguments[] issues)
+            import json as _json
+
+            email_js = _json.dumps(email)
             filled = self._js(
-                r"""
-const email = arguments[0];
-function isVisible(node) {
+                f"""
+const email = {email_js};
+function isVisible(node) {{
     if (!node) return false;
     const style = window.getComputedStyle(node);
     if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
-}
+}}
 const input = Array.from(document.querySelectorAll(
-  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"]'
+  'input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"], input[type="text"]'
 )).find((node) => isVisible(node) && !node.disabled && !node.readOnly) || null;
 if (!input) return 'not-ready';
 input.focus(); input.click();
@@ -216,24 +240,46 @@ const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 
 const tracker = input._valueTracker;
 if (tracker) tracker.setValue('');
 if (valueSetter) valueSetter.call(input, email); else input.value = email;
-input.dispatchEvent(new Event('focus', { bubbles: true }));
-input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: email, inputType: 'insertText' }));
-input.dispatchEvent(new InputEvent('input', { bubbles: true, data: email, inputType: 'insertText' }));
-input.dispatchEvent(new Event('change', { bubbles: true }));
-input.dispatchEvent(new Event('blur', { bubbles: true }));
+input.dispatchEvent(new Event('focus', {{ bubbles: true }}));
+input.dispatchEvent(new InputEvent('input', {{ bubbles: true, data: email, inputType: 'insertText' }}));
+input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+input.dispatchEvent(new Event('blur', {{ bubbles: true }}));
 if ((input.value || '').trim() === email) return 'filled';
-return input.value;
-""",
-                email,
+return 'value=' + (input.value || '');
+"""
             )
+            last_status = str(filled)
             if filled == "not-ready":
-                self._sleep(0.5)
+                # re-click email path if form not shown
+                if time.time() + 5 < deadline:
+                    self._click_email_signup()
+                self._sleep(0.6)
                 continue
             if filled != "filled":
-                self.log(f"[reg] email fill result={filled!r}")
-                self._sleep(0.5)
-                continue
-            self._sleep(0.6)
+                # DrissionPage ele() fallback
+                try:
+                    for sel in (
+                        'css:input[type=email]',
+                        'css:input[name=email]',
+                        'css:input[data-testid=email]',
+                        'css:input[autocomplete=email]',
+                    ):
+                        el = self.page.ele(sel, timeout=1)
+                        if el:
+                            try:
+                                el.clear()
+                            except Exception:
+                                pass
+                            el.input(email)
+                            filled = "filled"
+                            break
+                except Exception as exc:
+                    self.log(f"[reg] ele fill fallback: {exc}")
+                if filled != "filled":
+                    self.log(f"[reg] email fill result={filled!r}")
+                    self._sleep(0.5)
+                    continue
+            self._sleep(0.8)
             clicked = self._js(
                 r"""
 function isVisible(node) {
@@ -250,10 +296,11 @@ const submitButton = buttons.find((node) => {
     const text = (node.innerText || node.textContent || '').replace(/\s+/g, '');
     const lower = text.toLowerCase();
     return (
-        text.includes('注册') || lower.includes('sign up') || lower.includes('continue') ||
-        lower.includes('next') || lower.includes('submit')
+        text === '注册' || text.includes('注册') ||
+        lower.includes('sign up') || lower.includes('signup') ||
+        lower.includes('continue') || lower.includes('next') || lower.includes('submit')
     );
-});
+}) || buttons.find((node) => (node.getAttribute('type') || '') === 'submit');
 if (!submitButton) return false;
 submitButton.click();
 return true;
@@ -263,8 +310,24 @@ return true;
                 self.log(f"[reg] email submitted: {email}")
                 self._sleep(2)
                 return
+            # fallback: Enter key
+            try:
+                self.page.actions.key_down("ENTER").key_up("ENTER")
+                self.log(f"[reg] email submitted via Enter: {email}")
+                self._sleep(2)
+                return
+            except Exception:
+                pass
             self._sleep(0.5)
-        raise BrowserRegisterError("email input/submit not found")
+        # debug dump
+        try:
+            snippet = self._js(
+                "return (document.body && document.body.innerText || '').slice(0, 400)"
+            )
+            self.log(f"[reg] page text: {snippet!r}")
+        except Exception:
+            pass
+        raise BrowserRegisterError(f"email input/submit not found (last={last_status})")
 
     def _resend_code(self) -> None:
         self._js(
@@ -517,7 +580,11 @@ return false;
             pass
 
     def register_one(self) -> dict[str, Any]:
-        """Full register once. Returns email/password/sso/profile."""
+        """Full register once. Returns email/password/sso/profile.
+
+        Order matches sample register_cli:
+          create mailbox → open signup → fill email (when form ready) → wait code → profile → sso
+        """
         if self._page is None:
             self.start()
         max_mail = max(1, int(self.cfg.get("register_max_attempts") or self.cfg.get("mail_retry_count") or 3))
@@ -525,10 +592,10 @@ return false;
         for attempt in range(1, max_mail + 1):
             try:
                 self.log(f"[reg] attempt {attempt}/{max_mail}")
-                self.open_signup()
+                # create mailbox first so form fill is not delayed by API
                 email, token = self._mail.create_address()
+                self.open_signup()
                 self.fill_email(email)
-                # wait for code with optional resend mid-way
                 mail_timeout = float(self.cfg.get("mail_timeout") or self.cfg.get("tempmail_timeout") or 150)
                 half = max(30.0, mail_timeout / 2)
                 try:
