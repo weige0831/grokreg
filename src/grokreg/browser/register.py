@@ -67,6 +67,13 @@ class BrowserRegistrar:
     def start(self) -> None:
         from DrissionPage import Chromium, ChromiumOptions
 
+        # Optional: attach existing fingerprint browser via CDP (BitBrowser / AdsPower / etc.)
+        # config: "fingerprint_cdp": "127.0.0.1:9222"  or full "http://127.0.0.1:9222"
+        cdp = str(self.cfg.get("fingerprint_cdp") or self.cfg.get("cdp_url") or "").strip()
+        if cdp:
+            self._start_fingerprint_cdp(cdp)
+            return
+
         co = ChromiumOptions()
         try:
             co.auto_port()
@@ -74,14 +81,34 @@ class BrowserRegistrar:
             pass
         headless = bool(self.cfg.get("headless", False))
         if headless:
-            co.headless(True)
+            # CF/Turnstile is usually blocked in true headless; prefer headed
+            try:
+                co.headless(True)
+            except Exception:
+                co.set_argument("--headless=new")
         browser_path = str(self.cfg.get("browser_path") or "").strip()
         if browser_path:
             co.set_browser_path(browser_path)
         proxy = str(self.cfg.get("proxy") or "").strip()
         if proxy:
-            co.set_proxy(proxy)
-        ua = str(self.cfg.get("user_agent") or "").strip()
+            # Chromium --proxy-server cannot embed user:pass; strip auth if present
+            try:
+                from urllib.parse import urlparse
+
+                u = urlparse(proxy if "://" in proxy else f"http://{proxy}")
+                host = u.hostname or ""
+                if host:
+                    port = u.port or (443 if (u.scheme or "http") == "https" else 80)
+                    scheme = u.scheme or "http"
+                    co.set_argument(f"--proxy-server={scheme}://{host}:{port}")
+                else:
+                    co.set_proxy(proxy)
+            except Exception:
+                co.set_proxy(proxy)
+        ua = str(
+            self.cfg.get("user_agent")
+            or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+        ).strip()
         if ua:
             co.set_user_agent(ua)
 
@@ -97,7 +124,7 @@ class BrowserRegistrar:
             co.set_timeouts(base=1)
         except Exception:
             pass
-        # sample CHROMIUM_SLIM_FLAGS + anti-detect
+        # sample CHROMIUM_SLIM_FLAGS + anti-detect (fingerprint-like)
         for flag in (
             "--disable-gpu",
             "--disable-software-rasterizer",
@@ -107,16 +134,85 @@ class BrowserRegistrar:
             "--disable-background-networking",
             "--no-first-run",
             "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--disable-features=IsolateOrigins,site-per-process,AutomationControlled",
             "--lang=en-US",
+            "--window-size=1280,900",
         ):
             try:
                 co.set_argument(flag)
             except Exception:
                 pass
+        # Prefer non-automation binary prefs when supported
+        for meth, arg in (
+            ("set_pref", ("excludeSwitches", ["enable-automation"])),
+            ("set_pref", ("useAutomationExtension", False)),
+        ):
+            try:
+                getattr(co, meth)(*arg)
+            except Exception:
+                pass
 
-        self.log(f"[browser] start headless={headless} proxy={bool(proxy)}")
+        self.log(f"[browser] start headless={headless} proxy={bool(proxy)} fingerprint=local-stealth")
         self._browser = Chromium(co)
         self._page = self._browser.latest_tab
+        self._inject_stealth()
+
+    def _start_fingerprint_cdp(self, cdp: str) -> None:
+        """Connect to an already-running fingerprint browser (BitBrowser/AdsPower/Chrome debug)."""
+        from DrissionPage import Chromium
+
+        addr = cdp.replace("http://", "").replace("https://", "").strip().rstrip("/")
+        self.log(f"[browser] attach fingerprint CDP {addr}")
+        # DrissionPage: Chromium(addr) or set_address
+        try:
+            self._browser = Chromium(addr)
+        except TypeError:
+            from DrissionPage import ChromiumOptions
+
+            co = ChromiumOptions()
+            co.set_address(addr)
+            self._browser = Chromium(co)
+        self._page = self._browser.latest_tab
+        self._inject_stealth()
+
+    def _inject_stealth(self) -> None:
+        """CDP stealth + sample-like anti-detect (fingerprint environment)."""
+        page = self._page
+        if page is None:
+            return
+        stealth_js = r"""
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+try {
+  window.chrome = window.chrome || { runtime: {} };
+} catch(e) {}
+try {
+  Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+} catch(e) {}
+try {
+  Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+} catch(e) {}
+try {
+  const originalQuery = window.navigator.permissions.query;
+  window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications'
+      ? Promise.resolve({ state: Notification.permission })
+      : originalQuery(parameters)
+  );
+} catch(e) {}
+"""
+        # Prefer CDP addScriptToEvaluateOnNewDocument for every navigation
+        for call in (
+            lambda: page.run_cdp("Page.addScriptToEvaluateOnNewDocument", source=stealth_js),
+            lambda: page.run_cdp("Page.addScriptToEvaluateOnNewDocument", {"source": stealth_js}),
+            lambda: page.run_js(stealth_js),
+        ):
+            try:
+                call()
+                self.log("[browser] stealth injected")
+                break
+            except Exception:
+                continue
 
     def stop(self) -> None:
         try:
@@ -469,10 +565,15 @@ return 'clicked';
         deadline = time.time() + float(self.cfg.get("profile_timeout") or 180)
         form_filled = False
         wait_cf_since = 0.0
-        # on GHA/datacenter, CF often never fills token; after this many seconds force-submit
-        cf_force_after = float(self.cfg.get("turnstile_force_submit_sec") or 25)
+        # Prefer solving Turnstile (click red-box checkbox) before force-submit
+        cf_force_after = float(self.cfg.get("turnstile_force_submit_sec") or 55)
         self.log("[reg] preheat turnstile…")
-        self._sleep(2)
+        self._sleep(1.5)
+        # actively click checkbox while form loads
+        try:
+            self._click_turnstile_checkbox()
+        except Exception:
+            pass
 
         while time.time() < deadline:
             force_cf = bool(wait_cf_since and (time.time() - wait_cf_since) >= cf_force_after)
@@ -531,13 +632,12 @@ return forceCf ? 'force-submit' : 'ready-to-submit';
                     form_filled = True
                     if not wait_cf_since:
                         wait_cf_since = time.time()
-                    # sample: secondary turnstile reuse while waiting
-                    if time.time() - wait_cf_since >= 8:
-                        tok = self.get_turnstile_token(rounds=8)
-                        if tok:
-                            tjs = _json.dumps(tok)
-                            self._js(
-                                f"""
+                    # sample: keep clicking red-box + inject token when ready
+                    tok = self.get_turnstile_token(rounds=6)
+                    if tok:
+                        tjs = _json.dumps(tok)
+                        self._js(
+                            f"""
 const token = {tjs};
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
 if (!cfInput || !token) return false;
@@ -547,13 +647,32 @@ cfInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
 cfInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
 return String(cfInput.value || '').trim().length;
 """
-                            )
-                    self._sleep(1)
+                        )
+                    else:
+                        self._click_turnstile_checkbox()
+                    self._sleep(0.8)
                     continue
                 if filled in ("ready-to-submit", "filled-no-submit", "force-submit"):
                     form_filled = True
 
             force_cf = bool(wait_cf_since and (time.time() - wait_cf_since) >= cf_force_after)
+            # if CF still empty, try solve before force
+            if not force_cf:
+                tok = self.get_turnstile_token(rounds=3)
+                if tok:
+                    tjs = _json.dumps(tok)
+                    self._js(
+                        f"""
+const token = {tjs};
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!cfInput || !token) return 0;
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+if (nativeSetter) nativeSetter.call(cfInput, token); else cfInput.value = token;
+cfInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+cfInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+return String(cfInput.value || '').trim().length;
+"""
+                    )
             submit_state = self._js(
                 f"""
 const forceCf = {str(force_cf).lower()};
@@ -724,16 +843,158 @@ return String(cfInput.value || '').trim().length;
         except Exception:
             pass
 
-    def get_turnstile_token(self, rounds: int = 20) -> str:
-        """Sample getTurnstileToken: read token / click shadow-root checkbox."""
+    def _click_turnstile_checkbox(self) -> bool:
+        """Click the red-box checkbox inside CF Turnstile (sample getTurnstileToken path).
+
+        DOM path (from sample / grokRegister-cpa):
+          input[name=cf-turnstile-response]
+            -> parent
+            -> shadow_root iframe
+            -> body.shadow_root input[type=checkbox]
+        """
         page = self.page
+        clicked = False
+
+        # Path A: sample — @name=cf-turnstile-response → parent.shadow_root → iframe → body.shadow_root → input
+        try:
+            challenge = page.ele("@name=cf-turnstile-response", timeout=0.8)
+        except Exception:
+            challenge = None
+        if challenge is not None:
+            try:
+                wrapper = challenge.parent()
+                iframe = None
+                try:
+                    iframe = wrapper.shadow_root.ele("tag:iframe", timeout=0.5)
+                except Exception:
+                    try:
+                        iframe = wrapper.shadow_root.ele("css:iframe", timeout=0.5)
+                    except Exception:
+                        iframe = None
+                if iframe is not None:
+                    try:
+                        iframe.run_js(
+                            """
+window.dtp = 1;
+function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+let sx = getRandomInt(800, 1200);
+let sy = getRandomInt(400, 700);
+Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
+Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
+"""
+                        )
+                    except Exception:
+                        pass
+                    # click checkbox in nested shadow root (the red-box target)
+                    for getter in (
+                        lambda: iframe.ele("tag:body", timeout=0.5).shadow_root.ele("tag:input", timeout=0.5),
+                        lambda: iframe.ele("tag:body", timeout=0.5).shadow_root.ele("css:input[type=checkbox]", timeout=0.5),
+                        lambda: iframe.ele("tag:body", timeout=0.5).shadow_root.ele("css:.mark", timeout=0.5),
+                        lambda: iframe.ele("tag:body", timeout=0.5).shadow_root.ele("css:label", timeout=0.5),
+                    ):
+                        try:
+                            btn = getter()
+                            if btn is not None:
+                                try:
+                                    btn.click(by_js=False)
+                                except Exception:
+                                    btn.click()
+                                self.log("[reg] clicked turnstile checkbox (shadow)")
+                                clicked = True
+                                break
+                        except Exception:
+                            continue
+            except Exception as exc:
+                self.log(f"[reg] turnstile shadow path: {exc}")
+
+        # Path B: any challenges.cloudflare.com iframe → body shadow checkbox
+        if not clicked:
+            try:
+                frames = page.eles("tag:iframe", timeout=0.5) or []
+            except Exception:
+                frames = []
+            for fr in frames:
+                try:
+                    src = ""
+                    try:
+                        src = fr.attr("src") or ""
+                    except Exception:
+                        pass
+                    if "challenges.cloudflare.com" not in src and "turnstile" not in src.lower():
+                        continue
+                    try:
+                        fr.run_js(
+                            """
+window.dtp = 1;
+function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+Object.defineProperty(MouseEvent.prototype, 'screenX', { value: getRandomInt(800,1200) });
+Object.defineProperty(MouseEvent.prototype, 'screenY', { value: getRandomInt(400,700) });
+"""
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        body = fr.ele("tag:body", timeout=0.5)
+                        sr = body.shadow_root
+                        for sel in ("tag:input", "css:input[type=checkbox]", "css:.mark", "css:label"):
+                            try:
+                                el = sr.ele(sel, timeout=0.3)
+                            except Exception:
+                                el = None
+                            if el is not None:
+                                try:
+                                    el.click(by_js=False)
+                                except Exception:
+                                    el.click()
+                                self.log("[reg] clicked turnstile checkbox (iframe)")
+                                clicked = True
+                                break
+                    except Exception:
+                        continue
+                    if clicked:
+                        break
+                except Exception:
+                    continue
+
+        # Path C: JS click on turnstile widgets (fallback, not the real checkbox)
+        if not clicked:
+            try:
+                self._js(
+                    r"""
+const nodes = Array.from(document.querySelectorAll('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey]'));
+for (const n of nodes) {
+  try {
+    n.scrollIntoView({block:'center', inline:'center'});
+    const r = n.getBoundingClientRect();
+    // click center of widget (checkbox is usually left side of widget)
+    const x = r.left + Math.min(30, r.width * 0.15);
+    const y = r.top + r.height / 2;
+    for (const type of ['mousemove','mousedown','mouseup','click']) {
+      n.dispatchEvent(new MouseEvent(type, {bubbles:true, clientX:x, clientY:y, view:window}));
+    }
+    if (typeof n.click === 'function') n.click();
+  } catch(e) {}
+}
+return nodes.length;
+"""
+                )
+                self.log("[reg] clicked turnstile widget (js fallback)")
+                clicked = True
+            except Exception:
+                pass
+        return clicked
+
+    def get_turnstile_token(self, rounds: int = 25) -> str:
+        """Sample getTurnstileToken: click red-box checkbox until token appears."""
         try:
             self._js(
                 "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
             )
         except Exception:
             pass
+
         for i in range(rounds):
+            # 1) already solved?
             try:
                 token = self._js(
                     r"""
@@ -751,58 +1012,32 @@ try {
                 if len(token) >= 80:
                     self.log(f"[reg] turnstile token len={len(token)}")
                     return token
-                # sample: shadow_root checkbox click
-                try:
-                    challenge = page.ele("@name=cf-turnstile-response", timeout=0.5)
-                except Exception:
-                    challenge = None
-                if challenge:
-                    try:
-                        wrapper = challenge.parent()
-                        iframe = None
-                        try:
-                            iframe = wrapper.shadow_root.ele("tag:iframe")
-                        except Exception:
-                            iframe = None
-                        if iframe:
-                            try:
-                                iframe.run_js(
-                                    """
-window.dtp = 1;
-function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-let sx = getRandomInt(800, 1200);
-let sy = getRandomInt(400, 700);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
-"""
-                                )
-                            except Exception:
-                                pass
-                            try:
-                                body_sr = iframe.ele("tag:body").shadow_root
-                                btn = body_sr.ele("tag:input")
-                                if btn:
-                                    btn.click()
-                                    self.log("[reg] clicked turnstile checkbox")
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                else:
-                    self._js(
-                        r"""
-const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
-  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
-  return String(txt).toLowerCase().includes('turnstile');
-});
-if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
-"""
-                    )
             except Exception as exc:
                 if i == 0:
-                    self.log(f"[reg] turnstile try: {exc}")
-            self._sleep(1)
+                    self.log(f"[reg] turnstile read: {exc}")
+
+            # 2) click the checkbox (red box)
+            try:
+                self._click_turnstile_checkbox()
+            except Exception as exc:
+                if i == 0:
+                    self.log(f"[reg] turnstile click: {exc}")
+
+            # 3) small human-like delay
+            self._sleep(0.8 + (0.15 * (i % 3)))
         return ""
+
+    def wait_turnstile(self, timeout: float | None = None) -> bool:
+        """Block until CF token ready (sample _wait_turnstile)."""
+        timeout = float(timeout if timeout is not None else self.cfg.get("turnstile_stuck_timeout") or 90)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            tok = self.get_turnstile_token(rounds=3)
+            if tok:
+                return True
+            self._sleep(0.5)
+        self.log("[reg] turnstile wait timeout")
+        return False
 
     def register_one(self) -> dict[str, Any]:
         """Full register once. Returns email/password/sso/profile.
