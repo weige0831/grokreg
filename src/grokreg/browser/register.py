@@ -460,10 +460,13 @@ return 'clicked';
         deadline = time.time() + float(self.cfg.get("profile_timeout") or 180)
         form_filled = False
         wait_cf_since = 0.0
+        # on GHA/datacenter, CF often never fills token; after this many seconds force-submit
+        cf_force_after = float(self.cfg.get("turnstile_force_submit_sec") or 25)
         self.log("[reg] preheat turnstile…")
         self._sleep(2)
 
         while time.time() < deadline:
+            force_cf = bool(wait_cf_since and (time.time() - wait_cf_since) >= cf_force_after)
             if not form_filled:
                 g, f, p = _json.dumps(first), _json.dumps(last), _json.dumps(password)
                 filled = self._js(
@@ -471,6 +474,7 @@ return 'clicked';
 const givenName = {g};
 const familyName = {f};
 const password = {p};
+const forceCf = {str(force_cf).lower()};
 function isVisible(node) {{
     if (!node) return false;
     const style = window.getComputedStyle(node);
@@ -503,11 +507,11 @@ const ok3 = setInputValue(passwordInput, password);
 if (!ok1 || !ok2 || !ok3) return 'fill-failed';
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
 const cfPresent = !!cfInput || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {{
+if (cfPresent && !forceCf) {{
   const token = String((cfInput && cfInput.value) || '').trim();
   if (token.length < 80) return 'wait-cloudflare:' + token.length;
 }}
-return 'ready-to-submit';
+return forceCf ? 'force-submit' : 'ready-to-submit';
 """
                 )
                 self.log(f"[reg] profile fill state={filled}")
@@ -520,44 +524,48 @@ return 'ready-to-submit';
                         wait_cf_since = time.time()
                     self._sleep(1)
                     continue
-                if filled in ("ready-to-submit", "filled-no-submit"):
+                if filled in ("ready-to-submit", "filled-no-submit", "force-submit"):
                     form_filled = True
 
+            force_cf = bool(wait_cf_since and (time.time() - wait_cf_since) >= cf_force_after)
             submit_state = self._js(
-                r"""
-function isVisible(node) {
+                f"""
+const forceCf = {str(force_cf).lower()};
+function isVisible(node) {{
     if (!node) return false;
     const style = window.getComputedStyle(node);
     if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
-}
+}}
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
 const cfPresent = !!cfInput
   || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {
+if (cfPresent && !forceCf) {{
     const token = String((cfInput && cfInput.value) || '').trim();
     if (token.length < 80) return 'wait-cloudflare:' + token.length;
-}
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
+}}
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {{
     return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitBtn = buttons.find((node) => {
-    const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
+}});
+const submitBtn = buttons.find((node) => {{
+    const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
     return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') ||
            t.includes('sign up') || t.includes('createaccount') || t.includes('create') || t.includes('注册');
-});
+}});
 if (!submitBtn) return 'no-submit-button';
 submitBtn.focus();
 submitBtn.click();
-return 'submitted';
+return forceCf ? 'submitted-force' : 'submitted';
 """
             )
             self.log(f"[reg] profile submit={submit_state}")
             if isinstance(submit_state, str) and submit_state.startswith("wait-cloudflare"):
+                if not wait_cf_since:
+                    wait_cf_since = time.time()
                 self._sleep(1)
                 continue
-            if submit_state == "submitted":
+            if submit_state in ("submitted", "submitted-force"):
                 self._sleep(2)
                 return {"given_name": first, "family_name": last, "password": password}
             self._sleep(0.6)
