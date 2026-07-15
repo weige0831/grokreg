@@ -1,0 +1,196 @@
+name: register-probe-only
+
+# Register + Build 4.5 probe only. Does NOT upload to grok2api.
+# Artifacts: accounts.txt, results.jsonl, importable.jsonl (scheduler-ready JSON lines)
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "How many accounts to register"
+        required: true
+        default: "1"
+      headless:
+        description: "Run Chromium headless"
+        required: false
+        default: "true"
+
+jobs:
+  register-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            chromium-browser chromium-chromedriver \
+            fonts-liberation fonts-noto-cjk xvfb ca-certificates || \
+          sudo apt-get install -y --no-install-recommends \
+            chromium chromium-driver fonts-liberation fonts-noto-cjk xvfb ca-certificates
+
+      - name: Setup uv / Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project
+        run: uv sync
+
+      - name: Write config (no upload)
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          TEMPMAIL_BASE_URL: ${{ secrets.TEMPMAIL_BASE_URL }}
+          HEADLESS: ${{ inputs.headless }}
+        run: |
+          python - <<'PY'
+          import json, os
+          cfg = json.load(open("config.example.json", encoding="utf-8"))
+          cfg["proxy"] = os.environ.get("PROXY_URL") or ""
+          if os.environ.get("TEMPMAIL_BASE_URL"):
+              cfg["tempmail_base_url"] = os.environ["TEMPMAIL_BASE_URL"]
+          cfg["headless"] = (os.environ.get("HEADLESS") or "true").lower() == "true"
+          cfg["register_count"] = int("${{ inputs.count }}" or "1")
+          # critical: do not upload to grok2api
+          cfg["grok2api_auto_add_remote"] = False
+          cfg["grok2api_remote_base"] = ""
+          cfg["grok2api_remote_app_key"] = ""
+          for p in ("/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome"):
+              if os.path.exists(p):
+                  cfg["browser_path"] = p
+                  break
+          json.dump(cfg, open("config.json", "w", encoding="utf-8"), indent=2)
+          print("config written: auto_add_remote=false proxy=%s" % bool(cfg["proxy"]))
+          PY
+
+      - name: Run register + probe (no upload)
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          xvfb-run -a uv run python -m grokreg run --count ${{ inputs.count }}
+
+      - name: Build importable JSON for scheduler
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, pathlib
+
+          # pipeline writes importable.jsonl with full sso + tokens on probe_ok
+          side = pathlib.Path("importable.jsonl")
+          lines_out = []
+          if side.exists():
+              for line in side.read_text(encoding="utf-8").splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      it = json.loads(line)
+                  except Exception:
+                      continue
+                  it.setdefault("source", "gha-register-probe-only")
+                  tags = it.get("tags") or []
+                  if "no-upload" not in tags:
+                      tags = list(tags) + ["no-upload"]
+                  it["tags"] = tags
+                  lines_out.append(it)
+
+          # fallback: accounts.txt only (sso present, tokens may be empty)
+          if not lines_out:
+              accounts = pathlib.Path("accounts.txt")
+              results = pathlib.Path("results.jsonl")
+              ok_emails = set()
+              if results.exists():
+                  for line in results.read_text(encoding="utf-8").splitlines():
+                      try:
+                          r = json.loads(line)
+                      except Exception:
+                          continue
+                      if r.get("status") in ("probe_ok", "upload_ok", "upload_fail"):
+                          ok_emails.add(str(r.get("email") or ""))
+              if accounts.exists():
+                  for line in accounts.read_text(encoding="utf-8").splitlines():
+                      line = line.strip()
+                      if not line or "----" not in line:
+                          continue
+                      parts = line.split("----")
+                      if len(parts) < 3:
+                          continue
+                      email, password, sso = parts[0].strip(), parts[1].strip(), parts[-1].strip()
+                      if ok_emails and email not in ok_emails:
+                          continue
+                      lines_out.append({
+                          "email": email,
+                          "password": password,
+                          "sso": sso,
+                          "access_token": "",
+                          "refresh_token": "",
+                          "source": "gha-register-probe-only",
+                          "probe_status": 200,
+                          "probe_detail": "probe_ok",
+                          "tags": ["probe-ok", "no-upload"],
+                      })
+
+          pathlib.Path("importable.json").write_text(
+              json.dumps(lines_out, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          with side.open("w", encoding="utf-8") as f:
+              for it in lines_out:
+                  f.write(json.dumps(it, ensure_ascii=False) + "\n")
+          print(f"importable accounts: {len(lines_out)}")
+          for it in lines_out:
+              at = it.get("access_token") or ""
+              print(f"  - {it.get('email')} access={'yes' if at else 'no'} sso_len={len(it.get('sso') or '')}")
+          PY
+
+      - name: Job summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path("results.jsonl")
+          lines = []
+          if p.exists():
+              for line in p.read_text(encoding="utf-8").splitlines():
+                  try:
+                      lines.append(json.loads(line))
+                  except Exception:
+                      pass
+          total = len(lines)
+          probe_ok = sum(1 for r in lines if r.get("status") == "probe_ok")
+          reg_fail = sum(1 for r in lines if r.get("status") == "reg_fail")
+          probe_fail = sum(1 for r in lines if r.get("status") == "probe_fail")
+          imp = pathlib.Path("importable.json")
+          n_imp = 0
+          if imp.exists():
+              try:
+                  n_imp = len(json.loads(imp.read_text(encoding="utf-8")))
+              except Exception:
+                  n_imp = 0
+          md = (
+              "## register-probe-only\n"
+              f"- total: {total}\n"
+              f"- probe_ok: {probe_ok}\n"
+              f"- probe_fail: {probe_fail}\n"
+              f"- reg_fail: {reg_fail}\n"
+              f"- importable: {n_imp}\n"
+              "- upload: **disabled**\n"
+          )
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              pathlib.Path(summary).write_text(md, encoding="utf-8")
+          print(md)
+          PY
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: register-probe-only
+          path: |
+            results.jsonl
+            accounts.txt
+            importable.json
+            importable.jsonl
+          if-no-files-found: warn

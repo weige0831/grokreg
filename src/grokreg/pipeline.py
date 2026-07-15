@@ -16,13 +16,34 @@ from grokreg.util.log import LogFn, default_log, prefix_log
 def _append_result(path: str | Path, row: dict[str, Any]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    # redact long sso in results
+    # redact long secrets in results.jsonl (importable export uses accounts + full fields separately)
     out = dict(row)
     sso = str(out.get("sso") or "")
     if len(sso) > 24:
         out["sso"] = sso[:12] + "..." + sso[-8:]
+    for k in ("access_token", "refresh_token"):
+        v = str(out.get(k) or "")
+        if len(v) > 24:
+            out[k] = v[:12] + "..." + v[-8:]
     with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps(out, ensure_ascii=False) + "\n")
+
+    # sidecar with full credentials for import (scheduler / manual test)
+    if row.get("status") in {"probe_ok", "upload_ok", "upload_fail"} and row.get("sso"):
+        side = p.with_name("importable.jsonl")
+        item = {
+            "email": row.get("email") or "",
+            "password": row.get("password") or "",
+            "sso": row.get("sso") or "",
+            "access_token": row.get("access_token") or "",
+            "refresh_token": row.get("refresh_token") or "",
+            "source": "grokreg",
+            "probe_status": 200 if row.get("status") in {"probe_ok", "upload_ok", "upload_fail"} else 0,
+            "probe_detail": str((row.get("probe") or {}).get("detail") or row.get("status") or ""),
+            "tags": ["probe-ok"],
+        }
+        with side.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def process_sso(
@@ -54,9 +75,11 @@ def process_sso(
         fail_status_codes=list(cfg.get("probe_fail_status_codes") or []),
         log=log,
     )
-    row["probe"] = {
-        k: v for k, v in probe.items() if k != "token"
-    }
+    token = probe.get("token") if isinstance(probe.get("token"), dict) else {}
+    if token:
+        row["access_token"] = str(token.get("access_token") or "")
+        row["refresh_token"] = str(token.get("refresh_token") or "")
+    row["probe"] = {k: v for k, v in probe.items() if k != "token"}
     if not probe.get("ok"):
         row["status"] = "probe_fail"
         row["code"] = str(probe.get("code") or "probe_fail")
@@ -65,6 +88,12 @@ def process_sso(
 
     row["status"] = "probe_ok"
     row["code"] = "probe_ok"
+
+    # skip remote upload when disabled (register/probe dry-run)
+    if not cfg.get("grok2api_auto_add_remote", True):
+        row["upload"] = {"ok": False, "code": "upload_skipped", "error": "auto_add_remote disabled"}
+        log("[pipe] upload skipped (auto_add_remote=false)")
+        return row
 
     only_after = bool(cfg.get("grok2api_upload_only_after_probe", True))
     if only_after and not probe.get("ok"):
