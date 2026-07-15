@@ -1,0 +1,71 @@
+name: probe-upload-only
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max accounts (0=all)"
+        required: false
+        default: "0"
+
+jobs:
+  probe-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup uv / Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project
+        run: uv sync
+
+      - name: Download accounts artifact (optional)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: grokreg-results
+          path: .
+
+      - name: Write config
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
+          GROK2API_APP_KEY: ${{ secrets.GROK2API_APP_KEY }}
+          GROK2API_POOL: ${{ secrets.GROK2API_POOL }}
+        run: |
+          python - <<'PY'
+          import json, os
+          cfg = json.load(open("config.example.json", encoding="utf-8"))
+          cfg["proxy"] = os.environ.get("PROXY_URL") or ""
+          cfg["grok2api_remote_base"] = os.environ.get("GROK2API_REMOTE_BASE") or ""
+          cfg["grok2api_remote_app_key"] = os.environ.get("GROK2API_APP_KEY") or ""
+          pool = os.environ.get("GROK2API_POOL") or "Build"
+          cfg["grok2api_pool_name"] = pool
+          if pool.lower() == "build":
+              cfg["grok2api_pool_api_value"] = "build"
+          json.dump(cfg, open("config.json", "w", encoding="utf-8"), indent=2)
+          PY
+
+      - name: Probe + upload
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
+          GROK2API_APP_KEY: ${{ secrets.GROK2API_APP_KEY }}
+        run: |
+          if [ ! -f accounts.txt ]; then
+            echo "accounts.txt missing — upload accounts.txt to the workspace or use register workflow first"
+            exit 1
+          fi
+          uv run python -m grokreg probe-upload --accounts accounts.txt --limit ${{ inputs.limit }}
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-upload-results
+          path: results.jsonl
+          if-no-files-found: warn

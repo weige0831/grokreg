@@ -1,0 +1,119 @@
+name: register-probe-upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "How many accounts to register"
+        required: true
+        default: "1"
+      headless:
+        description: "Run Chromium headless (not recommended)"
+        required: false
+        default: "false"
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            chromium-browser chromium-chromedriver \
+            fonts-liberation fonts-noto-cjk xvfb ca-certificates || \
+          sudo apt-get install -y --no-install-recommends \
+            chromium chromium-driver fonts-liberation fonts-noto-cjk xvfb ca-certificates
+
+      - name: Setup uv / Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project
+        run: uv sync
+
+      - name: Write config from secrets
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
+          GROK2API_APP_KEY: ${{ secrets.GROK2API_APP_KEY }}
+          GROK2API_POOL: ${{ secrets.GROK2API_POOL }}
+          TEMPMAIL_BASE_URL: ${{ secrets.TEMPMAIL_BASE_URL }}
+          HEADLESS: ${{ inputs.headless }}
+        run: |
+          python - <<'PY'
+          import json, os
+          cfg = json.load(open("config.example.json", encoding="utf-8"))
+          cfg["proxy"] = os.environ.get("PROXY_URL") or ""
+          cfg["grok2api_remote_base"] = os.environ.get("GROK2API_REMOTE_BASE") or ""
+          cfg["grok2api_remote_app_key"] = os.environ.get("GROK2API_APP_KEY") or ""
+          pool = os.environ.get("GROK2API_POOL") or "Build"
+          cfg["grok2api_pool_name"] = pool
+          if pool.lower() == "build":
+              cfg["grok2api_pool_api_value"] = "build"
+          if os.environ.get("TEMPMAIL_BASE_URL"):
+              cfg["tempmail_base_url"] = os.environ["TEMPMAIL_BASE_URL"]
+          cfg["headless"] = (os.environ.get("HEADLESS") or "false").lower() == "true"
+          cfg["register_count"] = int("${{ inputs.count }}" or "1")
+          # common chromium paths on ubuntu
+          for p in ("/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome"):
+              if os.path.exists(p):
+                  cfg["browser_path"] = p
+                  break
+          json.dump(cfg, open("config.json", "w", encoding="utf-8"), indent=2)
+          print("config written (secrets redacted)")
+          PY
+
+      - name: Run register pipeline
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
+          GROK2API_APP_KEY: ${{ secrets.GROK2API_APP_KEY }}
+        run: |
+          xvfb-run -a uv run python -m grokreg run --count ${{ inputs.count }}
+
+      - name: Job summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path("results.jsonl")
+          lines = []
+          if p.exists():
+              for line in p.read_text(encoding="utf-8").splitlines():
+                  try:
+                      lines.append(json.loads(line))
+                  except Exception:
+                      pass
+          total = len(lines)
+          upload_ok = sum(1 for r in lines if r.get("status") == "upload_ok")
+          probe_ok = sum(1 for r in lines if r.get("status") in ("probe_ok", "upload_ok", "upload_fail"))
+          reg_fail = sum(1 for r in lines if r.get("status") == "reg_fail")
+          probe_fail = sum(1 for r in lines if r.get("status") == "probe_fail")
+          md = (
+              "## grokreg summary\n"
+              f"- total: {total}\n"
+              f"- upload_ok: {upload_ok}\n"
+              f"- probe_ok-ish: {probe_ok}\n"
+              f"- probe_fail: {probe_fail}\n"
+              f"- reg_fail: {reg_fail}\n"
+          )
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              pathlib.Path(summary).write_text(md, encoding="utf-8")
+          print(md)
+          PY
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grokreg-results
+          path: |
+            results.jsonl
+            accounts.txt
+          if-no-files-found: warn
