@@ -9,7 +9,13 @@ from curl_cffi import requests
 
 from grokreg.util.log import LogFn, default_log
 
-CODE_RE = re.compile(r"\b(\d{6})\b")
+# xAI signup codes look like "ABC-DEF" (subject often: "ABC-DEF xAI")
+CODE_XAI_RE = re.compile(r"\b([A-Z0-9]{3}-[A-Z0-9]{3})\b", re.I)
+CODE_DIGIT_RE = re.compile(
+    r"(?:verification\s+code|your\s+code|confirm(?:ation)?\s+code|验证码)[:\s]+(\d{4,8})",
+    re.I,
+)
+CODE_FALLBACK_RE = re.compile(r"\b(\d{6})\b")
 SENDER_HINTS = ("x.ai", "xai", "grok", "accounts.x.ai", "noreply")
 
 
@@ -105,18 +111,23 @@ class TempMailClient:
         return data if isinstance(data, dict) else {}
 
     @staticmethod
-    def extract_code(text: str) -> str | None:
-        if not text:
-            return None
-        # Prefer "verification code is 123456" style
-        m = re.search(
-            r"(?:code|验证码|verification)[^\d]{0,40}(\d{6})",
-            text,
-            re.I,
-        )
+    def extract_code(text: str, subject: str = "") -> str | None:
+        """Match sample extract_verification_code: prefer ABC-DEF xAI codes."""
+        if subject:
+            m = re.search(r"^([A-Z0-9]{3}-[A-Z0-9]{3})\s+xAI", subject, re.I)
+            if m:
+                return m.group(1)
+            m = CODE_XAI_RE.search(subject)
+            if m:
+                return m.group(1)
+        blob = f"{subject}\n{text or ''}"
+        m = CODE_XAI_RE.search(blob)
         if m:
             return m.group(1)
-        m = CODE_RE.search(text)
+        m = CODE_DIGIT_RE.search(blob)
+        if m:
+            return m.group(1)
+        m = CODE_FALLBACK_RE.search(blob)
         return m.group(1) if m else None
 
     def _body_text(self, detail: dict[str, Any]) -> str:
@@ -125,14 +136,15 @@ class TempMailClient:
             v = detail.get(key)
             if isinstance(v, str) and v.strip():
                 parts.append(v)
-        # nested content
         content = detail.get("content")
         if isinstance(content, dict):
             for key in ("text", "html", "plain"):
                 v = content.get(key)
                 if isinstance(v, str) and v.strip():
                     parts.append(v)
-        return "\n".join(parts)
+        # strip simple HTML tags for code extraction
+        raw = "\n".join(parts)
+        return re.sub(r"<[^>]+>", " ", raw)
 
     def wait_code(
         self,
@@ -143,6 +155,7 @@ class TempMailClient:
     ) -> str:
         deadline = time.time() + (timeout if timeout is not None else self.timeout)
         seen: set[str] = set()
+        last_log = 0.0
         while time.time() < deadline:
             try:
                 emails = self.list_emails(token)
@@ -150,26 +163,44 @@ class TempMailClient:
                 self.log(f"[mail] list error: {exc}")
                 time.sleep(self.poll_interval)
                 continue
+            now = time.time()
+            if now - last_log >= 15:
+                self.log(f"[mail] polling… inbox={len(emails)} left={int(deadline - now)}s")
+                last_log = now
             for item in emails:
-                eid = str(item.get("id") or "")
-                if not eid or eid in seen:
-                    continue
+                eid = str(item.get("id") or item.get("_id") or item.get("message_id") or "")
                 subject = str(item.get("subject") or "")
-                frm = str(item.get("from") or item.get("sender") or "")
-                blob = f"{subject} {frm}".lower()
-                likely = any(h in blob for h in SENDER_HINTS) or True
-                if not likely:
+                frm = str(item.get("from") or item.get("sender") or item.get("from_address") or "")
+                # try extract from list subject first (xAI puts code in subject)
+                code = self.extract_code("", subject)
+                if code:
+                    self.log(f"[mail] code={code} from={frm!r} subject={subject!r} (list)")
+                    return code
+                if not eid or eid in seen:
+                    # still try body fields on list item
+                    preview = " ".join(
+                        str(item.get(k) or "")
+                        for k in ("text", "body", "preview", "snippet", "intro")
+                    )
+                    code = self.extract_code(preview, subject)
+                    if code:
+                        self.log(f"[mail] code={code} from={frm!r} subject={subject!r} (preview)")
+                        return code
+                    if eid:
+                        seen.add(eid)
                     continue
                 try:
                     detail = self.get_email(token, eid)
                 except TempMailError as exc:
                     self.log(f"[mail] detail error {eid}: {exc}")
+                    seen.add(eid)
                     continue
                 seen.add(eid)
-                text = self._body_text(detail) + "\n" + subject
-                code = self.extract_code(text)
+                det_subject = str(detail.get("subject") or subject)
+                text = self._body_text(detail)
+                code = self.extract_code(text, det_subject)
                 if code:
-                    self.log(f"[mail] code={code} from={frm!r} subject={subject!r}")
+                    self.log(f"[mail] code={code} from={frm!r} subject={det_subject!r}")
                     return code
             time.sleep(self.poll_interval)
         raise TempMailError("verification code timeout")
