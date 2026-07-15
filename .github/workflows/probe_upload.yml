@@ -36,18 +36,23 @@ jobs:
           GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
           GROK2API_APP_KEY: ${{ secrets.GROK2API_APP_KEY }}
           GROK2API_POOL: ${{ secrets.GROK2API_POOL }}
+          GROK2API_AUTO_UPLOAD: ${{ secrets.GROK2API_AUTO_UPLOAD }}
         run: |
           python - <<'PY'
           import json, os
           cfg = json.load(open("config.example.json", encoding="utf-8"))
           cfg["proxy"] = os.environ.get("PROXY_URL") or ""
+          # default OFF: only enable when secrets present AND AUTO_UPLOAD=true
+          auto = (os.environ.get("GROK2API_AUTO_UPLOAD") or "").lower() in {"1", "true", "yes"}
           cfg["grok2api_remote_base"] = os.environ.get("GROK2API_REMOTE_BASE") or ""
           cfg["grok2api_remote_app_key"] = os.environ.get("GROK2API_APP_KEY") or ""
+          cfg["grok2api_auto_add_remote"] = bool(auto and cfg["grok2api_remote_base"] and cfg["grok2api_remote_app_key"])
           pool = os.environ.get("GROK2API_POOL") or "Build"
           cfg["grok2api_pool_name"] = pool
           if pool.lower() == "build":
               cfg["grok2api_pool_api_value"] = "build"
           json.dump(cfg, open("config.json", "w", encoding="utf-8"), indent=2)
+          print("auto_add_remote=", cfg["grok2api_auto_add_remote"])
           PY
 
       - name: Probe + upload

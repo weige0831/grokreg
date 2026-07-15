@@ -1,12 +1,12 @@
 name: register-probe-upload
 
+# Legacy name kept. Behavior: single-account register + probe only.
+# Does NOT upload to grok2api (use scheduler frontend / manual push).
+# Prefer workflow: register-one-to-scheduler (register_probe_only.yml).
+
 on:
   workflow_dispatch:
     inputs:
-      count:
-        description: "How many accounts to register"
-        required: true
-        default: "1"
       headless:
         description: "Run Chromium headless (not recommended)"
         required: false
@@ -15,7 +15,7 @@ on:
 jobs:
   register:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -49,13 +49,13 @@ jobs:
           if os.environ.get("TEMPMAIL_BASE_URL"):
               cfg["tempmail_base_url"] = os.environ["TEMPMAIL_BASE_URL"]
           cfg["headless"] = (os.environ.get("HEADLESS") or "false").lower() == "true"
-          # force single account; do NOT auto-upload to grok2api
           cfg["register_count"] = 1
           cfg["grok2api_auto_add_remote"] = False
           cfg["grok2api_remote_base"] = ""
           cfg["grok2api_remote_app_key"] = ""
           cfg["browser_engine"] = "drission"
           cfg["browser_build_authorize"] = True
+          cfg["require_web_before_build"] = True
           for p in ("/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome"):
               if os.path.exists(p):
                   cfg["browser_path"] = p
@@ -84,17 +84,16 @@ jobs:
                   except Exception:
                       pass
           total = len(lines)
-          upload_ok = sum(1 for r in lines if r.get("status") == "upload_ok")
           probe_ok = sum(1 for r in lines if r.get("status") in ("probe_ok", "upload_ok", "upload_fail"))
           reg_fail = sum(1 for r in lines if r.get("status") == "reg_fail")
           probe_fail = sum(1 for r in lines if r.get("status") == "probe_fail")
           md = (
               "## grokreg summary\n"
-              f"- total: {total}\n"
-              f"- upload_ok: {upload_ok}\n"
-              f"- probe_ok-ish: {probe_ok}\n"
+              f"- total: {total} (fixed count=1)\n"
+              f"- probe_ok: {probe_ok}\n"
               f"- probe_fail: {probe_fail}\n"
               f"- reg_fail: {reg_fail}\n"
+              "- upload to grok2api: **disabled**\n"
           )
           summary = os.environ.get("GITHUB_STEP_SUMMARY")
           if summary:
@@ -110,4 +109,6 @@ jobs:
           path: |
             results.jsonl
             accounts.txt
+            importable.jsonl
+            g2a_auth/
           if-no-files-found: warn
