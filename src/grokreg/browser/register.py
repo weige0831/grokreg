@@ -579,47 +579,55 @@ return forceCf ? 'submitted-force' : 'submitted';
         )
         deadline = time.time() + timeout
         last_submit = 0.0
+        first_final = 0.0
+        cf_force_after = float(self.cfg.get("turnstile_force_submit_sec") or 25)
         self.log("[reg] wait sso cookie")
         while time.time() < deadline:
             now = time.time()
             # sample: if still on final signup page, re-click submit after CF
             if now - last_submit >= 2.5:
+                force_cf = bool(first_final and (now - first_final) >= cf_force_after)
                 retried = self._js(
-                    r"""
-function isVisible(node) {
+                    f"""
+const forceCf = {str(force_cf).lower()};
+function isVisible(node) {{
     if (!node) return false;
     const style = window.getComputedStyle(node);
     if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
-}
-const titleHit = !!Array.from(document.querySelectorAll('h1,h2,div,span')).find((el) => {
-    const t = (el.textContent || '').replace(/\s+/g, '');
-    return t.includes('完成注册') || t.toLowerCase().includes('complete') || t.toLowerCase().includes('create your');
-});
-if (!titleHit) return 'not-final-page';
+}}
+const titleHit = !!Array.from(document.querySelectorAll('h1,h2,div,span,button')).find((el) => {{
+    const t = (el.textContent || '').replace(/\\s+/g, '');
+    const lower = t.toLowerCase();
+    return t.includes('完成注册') || lower.includes('complete') || lower.includes('create your') ||
+           lower.includes('sign up') || t.includes('注册');
+}});
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
 const cfPresent = !!cfInput
   || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
-if (cfPresent) {
+if (cfPresent && !forceCf) {{
     const token = String((cfInput && cfInput.value) || '').trim();
     if (token.length < 80) return 'final-page-wait-cf:' + token.length;
-}
-const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {
+}}
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button')).filter((node) => {{
     return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const submitBtn = buttons.find((node) => {
-    const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
+}});
+const submitBtn = buttons.find((node) => {{
+    const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
     return t.includes('完成注册') || t.includes('创建账户') || t.includes('sign up') ||
            t.includes('signup') || t.includes('createaccount') || t.includes('create') || t.includes('注册');
-});
-if (!submitBtn) return 'final-page-no-submit';
+}}) || buttons[0];
+if (!submitBtn) return titleHit ? 'final-page-no-submit' : 'not-final-page';
 submitBtn.focus();
 submitBtn.click();
-return 'final-page-clicked-submit';
+return forceCf ? 'final-page-force-click' : 'final-page-clicked-submit';
 """
                 )
                 last_submit = now
+                if isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
+                    if not first_final:
+                        first_final = now
                 if retried and retried != "not-final-page":
                     self.log(f"[reg] final page: {retried}")
 
