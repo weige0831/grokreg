@@ -93,10 +93,19 @@ class BrowserRegistrar:
             except Exception as exc:
                 self.log(f"[browser] extension load skip: {exc}")
 
+        try:
+            co.set_timeouts(base=1)
+        except Exception:
+            pass
+        # sample CHROMIUM_SLIM_FLAGS + anti-detect
         for flag in (
+            "--disable-gpu",
+            "--disable-software-rasterizer",
             "--no-sandbox",
             "--disable-dev-shm-usage",
-            "--disable-gpu",
+            "--mute-audio",
+            "--disable-background-networking",
+            "--no-first-run",
             "--disable-blink-features=AutomationControlled",
             "--lang=en-US",
         ):
@@ -522,6 +531,23 @@ return forceCf ? 'force-submit' : 'ready-to-submit';
                     form_filled = True
                     if not wait_cf_since:
                         wait_cf_since = time.time()
+                    # sample: secondary turnstile reuse while waiting
+                    if time.time() - wait_cf_since >= 8:
+                        tok = self.get_turnstile_token(rounds=8)
+                        if tok:
+                            tjs = _json.dumps(tok)
+                            self._js(
+                                f"""
+const token = {tjs};
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!cfInput || !token) return false;
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+if (nativeSetter) nativeSetter.call(cfInput, token); else cfInput.value = token;
+cfInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+cfInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+return String(cfInput.value || '').trim().length;
+"""
+                            )
                     self._sleep(1)
                     continue
                 if filled in ("ready-to-submit", "filled-no-submit", "force-submit"):
@@ -628,6 +654,23 @@ return forceCf ? 'final-page-force-click' : 'final-page-clicked-submit';
                 if isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
                     if not first_final:
                         first_final = now
+                    # try shadow-root turnstile click / token inject
+                    tok = self.get_turnstile_token(rounds=6)
+                    if tok:
+                        import json as _json2
+                        tjs = _json2.dumps(tok)
+                        self._js(
+                            f"""
+const token = {tjs};
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!cfInput || !token) return false;
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+if (nativeSetter) nativeSetter.call(cfInput, token); else cfInput.value = token;
+cfInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
+cfInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+return String(cfInput.value || '').trim().length;
+"""
+                        )
                 if retried and retried != "not-final-page":
                     self.log(f"[reg] final page: {retried}")
 
@@ -680,6 +723,86 @@ return forceCf ? 'final-page-force-click' : 'final-page-clicked-submit';
                     break
         except Exception:
             pass
+
+    def get_turnstile_token(self, rounds: int = 20) -> str:
+        """Sample getTurnstileToken: read token / click shadow-root checkbox."""
+        page = self.page
+        try:
+            self._js(
+                "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
+            )
+        except Exception:
+            pass
+        for i in range(rounds):
+            try:
+                token = self._js(
+                    r"""
+try {
+  const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
+  if (byInput) return byInput;
+  if (window.turnstile && typeof turnstile.getResponse === 'function') {
+    return String(turnstile.getResponse() || '').trim();
+  }
+  return '';
+} catch(e) { return ''; }
+"""
+                )
+                token = str(token or "").strip()
+                if len(token) >= 80:
+                    self.log(f"[reg] turnstile token len={len(token)}")
+                    return token
+                # sample: shadow_root checkbox click
+                try:
+                    challenge = page.ele("@name=cf-turnstile-response", timeout=0.5)
+                except Exception:
+                    challenge = None
+                if challenge:
+                    try:
+                        wrapper = challenge.parent()
+                        iframe = None
+                        try:
+                            iframe = wrapper.shadow_root.ele("tag:iframe")
+                        except Exception:
+                            iframe = None
+                        if iframe:
+                            try:
+                                iframe.run_js(
+                                    """
+window.dtp = 1;
+function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+let sx = getRandomInt(800, 1200);
+let sy = getRandomInt(400, 700);
+Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
+Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
+"""
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                body_sr = iframe.ele("tag:body").shadow_root
+                                btn = body_sr.ele("tag:input")
+                                if btn:
+                                    btn.click()
+                                    self.log("[reg] clicked turnstile checkbox")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                else:
+                    self._js(
+                        r"""
+const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
+  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
+  return String(txt).toLowerCase().includes('turnstile');
+});
+if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
+"""
+                    )
+            except Exception as exc:
+                if i == 0:
+                    self.log(f"[reg] turnstile try: {exc}")
+            self._sleep(1)
+        return ""
 
     def register_one(self) -> dict[str, Any]:
         """Full register once. Returns email/password/sso/profile.
