@@ -14,6 +14,10 @@ on:
         description: "true=headless; false=headed (default)"
         required: false
         default: "false"
+      domains:
+        description: "Tempmail domains (comma-separated). Default: mtoosov.shop,olsbvgq.shop,htazmbb.shop"
+        required: false
+        default: "mtoosov.shop,olsbvgq.shop,htazmbb.shop"
 
 jobs:
   prepare:
@@ -55,6 +59,7 @@ jobs:
     uses: ./.github/workflows/register_windows.yml
     with:
       headless: ${{ inputs.headless || 'false' }}
+      domains: ${{ inputs.domains || 'mtoosov.shop,olsbvgq.shop,htazmbb.shop' }}
       slot: ${{ matrix.slot }}
     secrets: inherit
 

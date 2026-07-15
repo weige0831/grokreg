@@ -72,6 +72,17 @@ DEFAULTS: dict[str, Any] = {
 }
 
 
+def _parse_domains(raw: str) -> list[str]:
+    """Parse comma/space/semicolon separated domain list."""
+    out: list[str] = []
+    for part in str(raw or "").replace(";", ",").replace("\n", ",").split(","):
+        for bit in part.split():
+            d = bit.strip().lower().lstrip("@")
+            if d and d not in out:
+                out.append(d)
+    return out
+
+
 def _env_override(cfg: dict[str, Any]) -> dict[str, Any]:
     mapping = {
         "PROXY_URL": "proxy",
@@ -88,6 +99,12 @@ def _env_override(cfg: dict[str, Any]) -> dict[str, Any]:
     api_pool = os.environ.get("GROK2API_POOL_API", "").strip()
     if api_pool:
         cfg["grok2api_pool_api_value"] = api_pool
+    # custom tempmail domains: TEMPMAIL_DOMAINS=a.com,b.com
+    dom_raw = os.environ.get("TEMPMAIL_DOMAINS", "").strip()
+    if dom_raw:
+        domains = _parse_domains(dom_raw)
+        if domains:
+            cfg["tempmail_domains"] = domains
     return cfg
 
 

@@ -11,6 +11,10 @@ on:
         description: "true=Chromium --headless; false=headed under Xvfb (recommended)"
         required: false
         default: "false"
+      domains:
+        description: "Tempmail domains (comma-separated). Default: mtoosov.shop,olsbvgq.shop,htazmbb.shop"
+        required: false
+        default: "mtoosov.shop,olsbvgq.shop,htazmbb.shop"
 
 jobs:
   register-one:
@@ -41,9 +45,10 @@ jobs:
           PROXY_URL: ${{ secrets.PROXY_URL }}
           TEMPMAIL_BASE_URL: ${{ secrets.TEMPMAIL_BASE_URL }}
           HEADLESS: ${{ inputs.headless }}
+          TEMPMAIL_DOMAINS: ${{ inputs.domains }}
         run: |
           python - <<'PY'
-          import json, os
+          import json, os, re
           cfg = json.load(open("config.example.json", encoding="utf-8"))
           cfg["proxy"] = os.environ.get("PROXY_URL") or ""
           if os.environ.get("TEMPMAIL_BASE_URL"):
@@ -58,17 +63,30 @@ jobs:
           cfg["browser_build_authorize"] = True
           cfg["require_web_before_build"] = True
           cfg["post_register_cloak"] = False
+          raw = (os.environ.get("TEMPMAIL_DOMAINS") or "").strip()
+          default_domains = ["mtoosov.shop", "olsbvgq.shop", "htazmbb.shop"]
+          domains = []
+          if raw:
+              for part in re.split(r"[,;\s]+", raw):
+                  d = part.strip().lower().lstrip("@")
+                  if d and d not in domains:
+                      domains.append(d)
+          cfg["tempmail_domains"] = domains or default_domains
           for p in ("/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome"):
               if os.path.exists(p):
                   cfg["browser_path"] = p
                   break
           json.dump(cfg, open("config.json", "w", encoding="utf-8"), indent=2)
-          print("config: count=1 auto_add_remote=false proxy=%s" % bool(cfg["proxy"]))
+          print(
+              "config: count=1 auto_add_remote=false proxy=%s domains=%s"
+              % (bool(cfg["proxy"]), cfg["tempmail_domains"])
+          )
           PY
 
       - name: Run register + probe (one account)
         env:
           PROXY_URL: ${{ secrets.PROXY_URL }}
+          TEMPMAIL_DOMAINS: ${{ inputs.domains }}
         run: |
           xvfb-run -a uv run python -m grokreg run --count 1
 
