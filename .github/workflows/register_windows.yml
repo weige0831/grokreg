@@ -1,0 +1,123 @@
+name: register-windows-headed
+
+# Windows runner, headed Chromium. Single account register + probe.
+# Does NOT upload to grok2api.
+
+on:
+  workflow_dispatch:
+    inputs:
+      headless:
+        description: "true=headless; false=headed (default)"
+        required: false
+        default: "false"
+
+jobs:
+  register-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup uv / Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project
+        run: uv sync
+
+      - name: Write config (Windows headed, count=1)
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          TEMPMAIL_BASE_URL: ${{ secrets.TEMPMAIL_BASE_URL }}
+          HEADLESS: ${{ inputs.headless }}
+        shell: bash
+        run: |
+          python <<'PY'
+          import json, os
+          cfg = json.load(open("config.example.json", encoding="utf-8"))
+          cfg["proxy"] = os.environ.get("PROXY_URL") or ""
+          if os.environ.get("TEMPMAIL_BASE_URL"):
+              cfg["tempmail_base_url"] = os.environ["TEMPMAIL_BASE_URL"]
+          cfg["headless"] = (os.environ.get("HEADLESS") or "false").lower() == "true"
+          cfg["register_count"] = 1
+          cfg["grok2api_auto_add_remote"] = False
+          cfg["grok2api_remote_base"] = ""
+          cfg["grok2api_remote_app_key"] = ""
+          cfg["browser_engine"] = "drission"
+          cfg["browser_build_authorize"] = True
+          cfg["require_web_before_build"] = True
+          cfg["post_register_cloak"] = False
+          for p in (
+              r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+              r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+              r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+              r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+          ):
+              if os.path.exists(p):
+                  cfg["browser_path"] = p
+                  break
+          json.dump(cfg, open("config.json", "w", encoding="utf-8"), indent=2)
+          print(
+              "config: headless=%s browser_path=%s proxy=%s"
+              % (cfg["headless"], cfg.get("browser_path") or "(auto)", bool(cfg["proxy"]))
+          )
+          PY
+
+      - name: Run register + probe (headed)
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        shell: bash
+        run: uv run python -m grokreg run --count 1
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          python <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path("results.jsonl")
+          lines = []
+          if p.exists():
+              for line in p.read_text(encoding="utf-8").splitlines():
+                  try:
+                      lines.append(json.loads(line))
+                  except Exception:
+                      pass
+          total = len(lines)
+          probe_ok = sum(1 for r in lines if r.get("status") in ("probe_ok", "upload_ok", "upload_fail"))
+          reg_fail = sum(1 for r in lines if r.get("status") == "reg_fail")
+          probe_fail = sum(1 for r in lines if r.get("status") == "probe_fail")
+          md = (
+              "## register-windows-headed\n"
+              f"- total: {total}\n"
+              f"- probe_ok: {probe_ok}\n"
+              f"- probe_fail: {probe_fail}\n"
+              f"- reg_fail: {reg_fail}\n"
+              "- runner: windows-latest\n"
+          )
+          for r in lines:
+              md += (
+                  f"- email={r.get('email','?')} status={r.get('status')} "
+                  f"code={r.get('code')} usable={r.get('usable')}\n"
+              )
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              pathlib.Path(summary).write_text(md, encoding="utf-8")
+          print(md)
+          if lines:
+              print("RESULT_JSON=" + json.dumps(lines, ensure_ascii=False))
+          PY
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: register-windows-${{ github.run_id }}
+          path: |
+            results.jsonl
+            accounts.txt
+            importable.jsonl
+            g2a_auth/
+            diag/
+          if-no-files-found: warn
