@@ -1,7 +1,7 @@
 name: register-windows-headed
 
 # Windows runner, headed Chromium. Single account register + probe.
-# Does NOT upload to grok2api.
+# Does NOT upload to grok2api. Uploads probe_ok accounts to scheduler frontend.
 
 on:
   workflow_dispatch:
@@ -67,15 +67,138 @@ jobs:
       - name: Run register + probe (headed)
         env:
           PROXY_URL: ${{ secrets.PROXY_URL }}
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
         shell: bash
         run: uv run python -m grokreg run --count 1
 
-      - name: Job summary
+      - name: Build importable for scheduler
         if: always()
         shell: bash
         run: |
           python <<'PY'
-          import json, os, pathlib
+          import json, pathlib
+          side = pathlib.Path("importable.jsonl")
+          lines_out = []
+          if side.exists():
+              for line in side.read_text(encoding="utf-8").splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      it = json.loads(line)
+                  except Exception:
+                      continue
+                  it.setdefault("source", "gha-windows-headed")
+                  tags = list(it.get("tags") or [])
+                  for t in ("no-upload", "gha", "windows"):
+                      if t not in tags:
+                          tags.append(t)
+                  it["tags"] = tags
+                  lines_out.append(it)
+          pathlib.Path("importable.json").write_text(
+              json.dumps(lines_out, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          print(f"importable accounts: {len(lines_out)}")
+          for it in lines_out:
+              print(f"  - {it.get('email')} access={'yes' if it.get('access_token') else 'no'}")
+          PY
+
+      - name: Upload success account to scheduler frontend
+        if: always()
+        env:
+          SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
+          SCHEDULER_USER: ${{ secrets.SCHEDULER_USER }}
+          SCHEDULER_PASS: ${{ secrets.SCHEDULER_PASS }}
+          SCHEDULER_TOKEN: ${{ secrets.SCHEDULER_TOKEN }}
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        shell: bash
+        run: |
+          python <<'PY'
+          import json, os, pathlib, sys, urllib.error, urllib.request
+
+          base = (os.environ.get("SCHEDULER_URL") or "").rstrip("/")
+          if not base:
+              print("SCHEDULER_URL not set — skip frontend upload")
+              sys.exit(0)
+
+          imp = pathlib.Path("importable.json")
+          if not imp.exists():
+              print("no importable.json — skip")
+              sys.exit(0)
+          accounts = json.loads(imp.read_text(encoding="utf-8"))
+          if not accounts:
+              print("importable empty (probe not ok) — skip frontend upload")
+              sys.exit(0)
+
+          def req(method, url, data=None, token=""):
+              body = None if data is None else json.dumps(data).encode("utf-8")
+              headers = {"Content-Type": "application/json", "Accept": "application/json"}
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+              r = urllib.request.Request(url, data=body, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(r, timeout=60) as resp:
+                      raw = resp.read().decode("utf-8", errors="replace")
+                      return resp.status, json.loads(raw) if raw else {}
+              except urllib.error.HTTPError as e:
+                  raw = e.read().decode("utf-8", errors="replace")
+                  try:
+                      j = json.loads(raw) if raw else {}
+                  except Exception:
+                      j = {"raw": raw[:300]}
+                  return e.code, j
+
+          token = (os.environ.get("SCHEDULER_TOKEN") or "").strip()
+          if not token:
+              user = os.environ.get("SCHEDULER_USER") or "admin"
+              pwd = os.environ.get("SCHEDULER_PASS") or ""
+              if not pwd:
+                  print("need SCHEDULER_TOKEN or SCHEDULER_USER/PASS — skip")
+                  sys.exit(1)
+              code, login = req("POST", f"{base}/api/auth/login", {"username": user, "password": pwd})
+              if code != 200 or not login.get("token"):
+                  print(f"login failed status={code} body={login}")
+                  sys.exit(1)
+              token = login["token"]
+              print("scheduler login ok")
+
+          payload = {"accounts": []}
+          for a in accounts:
+              payload["accounts"].append({
+                  "email": a.get("email") or "",
+                  "password": a.get("password") or "",
+                  "sso": a.get("sso") or "",
+                  "access_token": a.get("access_token") or "",
+                  "refresh_token": a.get("refresh_token") or "",
+                  "id_token": a.get("id_token") or "",
+                  "probe_status": int(a.get("probe_status") or 200),
+                  "probe_detail": a.get("probe_detail") or "probe_ok",
+                  "tags": a.get("tags") or ["probe-ok", "gha", "windows"],
+                  "source": a.get("source") or "gha-windows-headed",
+              })
+          code, res = req("POST", f"{base}/api/accounts/import", payload, token=token)
+          print(f"import status={code} result={res}")
+          if code != 200:
+              sys.exit(1)
+          print("uploaded to scheduler frontend OK")
+          PY
+
+      - name: Job summary
+        if: always()
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        shell: bash
+        run: |
+          python <<'PY'
+          import json, os, pathlib, sys
+          # avoid Windows console encoding crash
+          try:
+              sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+          except Exception:
+              pass
           p = pathlib.Path("results.jsonl")
           lines = []
           if p.exists():
@@ -88,13 +211,23 @@ jobs:
           probe_ok = sum(1 for r in lines if r.get("status") in ("probe_ok", "upload_ok", "upload_fail"))
           reg_fail = sum(1 for r in lines if r.get("status") == "reg_fail")
           probe_fail = sum(1 for r in lines if r.get("status") == "probe_fail")
+          n_imp = 0
+          imp = pathlib.Path("importable.json")
+          if imp.exists():
+              try:
+                  n_imp = len(json.loads(imp.read_text(encoding="utf-8")))
+              except Exception:
+                  n_imp = 0
           md = (
               "## register-windows-headed\n"
               f"- total: {total}\n"
               f"- probe_ok: {probe_ok}\n"
               f"- probe_fail: {probe_fail}\n"
               f"- reg_fail: {reg_fail}\n"
+              f"- importable: {n_imp}\n"
               "- runner: windows-latest\n"
+              "- grok2api auto upload: disabled\n"
+              "- scheduler: via SCHEDULER_URL secrets\n"
           )
           for r in lines:
               md += (
@@ -104,9 +237,8 @@ jobs:
           summary = os.environ.get("GITHUB_STEP_SUMMARY")
           if summary:
               pathlib.Path(summary).write_text(md, encoding="utf-8")
-          print(md)
-          if lines:
-              print("RESULT_JSON=" + json.dumps(lines, ensure_ascii=False))
+          # ascii-safe console print
+          print(md.encode("ascii", errors="replace").decode("ascii"))
           PY
 
       - name: Upload artifacts
@@ -117,6 +249,7 @@ jobs:
           path: |
             results.jsonl
             accounts.txt
+            importable.json
             importable.jsonl
             g2a_auth/
             diag/

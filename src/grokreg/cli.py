@@ -31,9 +31,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "run":
         n = args.count or args.extra or 0
         results = run_register(cfg, count=n or None, log=default_log)
-        upload_ok = sum(1 for r in results if r.get("status") == "upload_ok")
-        # exit 0 if at least one success when count>1? prefer fail if none uploaded
-        return 0 if upload_ok or not results else 1
+        if not results:
+            return 1
+        # success if any usable / probe_ok (upload optional when auto_add disabled)
+        ok = sum(
+            1
+            for r in results
+            if r.get("usable") is True
+            or r.get("status") in {"probe_ok", "upload_ok", "upload_fail"}
+        )
+        return 0 if ok else 1
 
     if args.cmd == "probe-upload":
         results = run_probe_upload(
@@ -42,8 +49,15 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             log=default_log,
         )
-        upload_ok = sum(1 for r in results if r.get("status") == "upload_ok")
-        return 0 if upload_ok or not results else 1
+        if not results:
+            return 1
+        ok = sum(
+            1
+            for r in results
+            if r.get("usable") is True
+            or r.get("status") in {"probe_ok", "upload_ok", "upload_fail"}
+        )
+        return 0 if ok else 1
 
     if args.cmd == "mail-smoke":
         from grokreg.mail.tempmail import TempMailClient
