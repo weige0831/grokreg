@@ -1,6 +1,7 @@
 name: register-windows-headed
 
-# Windows runner, headed Chromium. Single account register + probe.
+# Single-account Windows headed register + probe.
+# Callable as child (workflow_call) or standalone (workflow_dispatch).
 # Does NOT upload to grok2api. Uploads probe_ok accounts to scheduler frontend.
 
 on:
@@ -10,11 +11,47 @@ on:
         description: "true=headless; false=headed (default)"
         required: false
         default: "false"
+      slot:
+        description: "batch slot id (for artifact naming)"
+        required: false
+        default: "1"
+  workflow_call:
+    inputs:
+      headless:
+        description: "true=headless; false=headed"
+        type: string
+        required: false
+        default: "false"
+      slot:
+        description: "batch slot id"
+        type: string
+        required: false
+        default: "1"
+    outputs:
+      probe_ok:
+        description: "1 if probe ok else 0"
+        value: ${{ jobs.register-windows.outputs.probe_ok }}
+      uploaded:
+        description: "accounts uploaded to scheduler"
+        value: ${{ jobs.register-windows.outputs.uploaded }}
+      email:
+        description: "registered email if any"
+        value: ${{ jobs.register-windows.outputs.email }}
+      status:
+        description: "pipeline status"
+        value: ${{ jobs.register-windows.outputs.status }}
 
 jobs:
   register-windows:
     runs-on: windows-latest
     timeout-minutes: 90
+    outputs:
+      probe_ok: ${{ steps.metrics.outputs.probe_ok }}
+      uploaded: ${{ steps.metrics.outputs.uploaded }}
+      email: ${{ steps.metrics.outputs.email }}
+      status: ${{ steps.metrics.outputs.status }}
+      reg_fail: ${{ steps.metrics.outputs.reg_fail }}
+      probe_fail: ${{ steps.metrics.outputs.probe_fail }}
     steps:
       - uses: actions/checkout@v4
 
@@ -65,6 +102,8 @@ jobs:
           PY
 
       - name: Run register + probe (headed)
+        id: run
+        continue-on-error: true
         env:
           PROXY_URL: ${{ secrets.PROXY_URL }}
           PYTHONIOENCODING: utf-8
@@ -105,7 +144,9 @@ jobs:
           PY
 
       - name: Upload success account to scheduler frontend
+        id: upload
         if: always()
+        continue-on-error: true
         env:
           SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
           SCHEDULER_USER: ${{ secrets.SCHEDULER_USER }}
@@ -118,18 +159,36 @@ jobs:
           python <<'PY'
           import json, os, pathlib, sys, urllib.error, urllib.request
 
+          result = {
+              "uploaded": 0,
+              "created": 0,
+              "updated": 0,
+              "skipped": 0,
+              "ok": False,
+              "error": "",
+          }
+
+          def save():
+              pathlib.Path("upload_result.json").write_text(
+                  json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+              )
+              print(json.dumps(result, ensure_ascii=False))
+
           base = (os.environ.get("SCHEDULER_URL") or "").rstrip("/")
           if not base:
-              print("SCHEDULER_URL not set — skip frontend upload")
+              result["error"] = "SCHEDULER_URL not set"
+              save()
               sys.exit(0)
 
           imp = pathlib.Path("importable.json")
           if not imp.exists():
-              print("no importable.json — skip")
+              result["error"] = "no importable.json"
+              save()
               sys.exit(0)
           accounts = json.loads(imp.read_text(encoding="utf-8"))
           if not accounts:
-              print("importable empty (probe not ok) — skip frontend upload")
+              result["error"] = "importable empty"
+              save()
               sys.exit(0)
 
           def req(method, url, data=None, token=""):
@@ -155,11 +214,13 @@ jobs:
               user = os.environ.get("SCHEDULER_USER") or "admin"
               pwd = os.environ.get("SCHEDULER_PASS") or ""
               if not pwd:
-                  print("need SCHEDULER_TOKEN or SCHEDULER_USER/PASS — skip")
+                  result["error"] = "need SCHEDULER_TOKEN or USER/PASS"
+                  save()
                   sys.exit(1)
               code, login = req("POST", f"{base}/api/auth/login", {"username": user, "password": pwd})
               if code != 200 or not login.get("token"):
-                  print(f"login failed status={code} body={login}")
+                  result["error"] = f"login failed {code}"
+                  save()
                   sys.exit(1)
               token = login["token"]
               print("scheduler login ok")
@@ -181,8 +242,105 @@ jobs:
           code, res = req("POST", f"{base}/api/accounts/import", payload, token=token)
           print(f"import status={code} result={res}")
           if code != 200:
+              result["error"] = f"import HTTP {code}: {res}"
+              save()
               sys.exit(1)
+          result["ok"] = True
+          result["created"] = int(res.get("created") or 0)
+          result["updated"] = int(res.get("updated") or 0)
+          result["skipped"] = int(res.get("skipped") or 0)
+          result["uploaded"] = int(res.get("total") or (result["created"] + result["updated"]))
+          save()
           print("uploaded to scheduler frontend OK")
+          PY
+
+      - name: Write metrics
+        id: metrics
+        if: always()
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+          SLOT: ${{ inputs.slot }}
+          RUN_OK: ${{ steps.run.outcome }}
+        shell: bash
+        run: |
+          python <<'PY'
+          import json, os, pathlib, sys
+          try:
+              sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+          except Exception:
+              pass
+
+          lines = []
+          p = pathlib.Path("results.jsonl")
+          if p.exists():
+              for line in p.read_text(encoding="utf-8").splitlines():
+                  try:
+                      lines.append(json.loads(line))
+                  except Exception:
+                      pass
+
+          probe_ok = sum(
+              1 for r in lines if r.get("status") in ("probe_ok", "upload_ok", "upload_fail") or r.get("usable") is True
+          )
+          reg_fail = sum(1 for r in lines if r.get("status") == "reg_fail")
+          probe_fail = sum(
+              1
+              for r in lines
+              if r.get("status") in ("probe_fail", "build_fail") or r.get("usable") is False
+          )
+          email = ""
+          status = ""
+          if lines:
+              email = str(lines[0].get("email") or "")
+              status = str(lines[0].get("status") or "")
+
+          uploaded = 0
+          upload_ok = False
+          up = pathlib.Path("upload_result.json")
+          if up.exists():
+              try:
+                  u = json.loads(up.read_text(encoding="utf-8"))
+                  uploaded = int(u.get("uploaded") or 0)
+                  upload_ok = bool(u.get("ok"))
+              except Exception:
+                  pass
+
+          n_imp = 0
+          imp = pathlib.Path("importable.json")
+          if imp.exists():
+              try:
+                  n_imp = len(json.loads(imp.read_text(encoding="utf-8")))
+              except Exception:
+                  n_imp = 0
+
+          metrics = {
+              "slot": os.environ.get("SLOT") or "1",
+              "run_outcome": os.environ.get("RUN_OK") or "",
+              "total": len(lines),
+              "probe_ok": probe_ok,
+              "probe_fail": probe_fail,
+              "reg_fail": reg_fail,
+              "importable": n_imp,
+              "uploaded": uploaded,
+              "upload_ok": upload_ok,
+              "email": email,
+              "status": status,
+          }
+          pathlib.Path("metrics.json").write_text(
+              json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+          )
+          # job outputs
+          gh = os.environ.get("GITHUB_OUTPUT")
+          if gh:
+              with open(gh, "a", encoding="utf-8") as f:
+                  f.write(f"probe_ok={probe_ok}\n")
+                  f.write(f"uploaded={uploaded}\n")
+                  f.write(f"email={email}\n")
+                  f.write(f"status={status}\n")
+                  f.write(f"reg_fail={reg_fail}\n")
+                  f.write(f"probe_fail={probe_fail}\n")
+          print(json.dumps(metrics, ensure_ascii=False))
           PY
 
       - name: Job summary
@@ -194,50 +352,37 @@ jobs:
         run: |
           python <<'PY'
           import json, os, pathlib, sys
-          # avoid Windows console encoding crash
           try:
               sys.stdout.reconfigure(encoding="utf-8", errors="replace")
           except Exception:
               pass
-          p = pathlib.Path("results.jsonl")
-          lines = []
-          if p.exists():
-              for line in p.read_text(encoding="utf-8").splitlines():
-                  try:
-                      lines.append(json.loads(line))
-                  except Exception:
-                      pass
-          total = len(lines)
-          probe_ok = sum(1 for r in lines if r.get("status") in ("probe_ok", "upload_ok", "upload_fail"))
-          reg_fail = sum(1 for r in lines if r.get("status") == "reg_fail")
-          probe_fail = sum(1 for r in lines if r.get("status") == "probe_fail")
-          n_imp = 0
-          imp = pathlib.Path("importable.json")
-          if imp.exists():
-              try:
-                  n_imp = len(json.loads(imp.read_text(encoding="utf-8")))
-              except Exception:
-                  n_imp = 0
+          m = {}
+          if pathlib.Path("metrics.json").exists():
+              m = json.loads(pathlib.Path("metrics.json").read_text(encoding="utf-8"))
           md = (
-              "## register-windows-headed\n"
-              f"- total: {total}\n"
-              f"- probe_ok: {probe_ok}\n"
-              f"- probe_fail: {probe_fail}\n"
-              f"- reg_fail: {reg_fail}\n"
-              f"- importable: {n_imp}\n"
+              "## register-windows-headed (slot {slot})\n"
+              "- email: {email}\n"
+              "- status: {status}\n"
+              "- probe_ok: {probe_ok}\n"
+              "- probe_fail: {probe_fail}\n"
+              "- reg_fail: {reg_fail}\n"
+              "- importable: {importable}\n"
+              "- uploaded_to_scheduler: {uploaded} (ok={upload_ok})\n"
               "- runner: windows-latest\n"
-              "- grok2api auto upload: disabled\n"
-              "- scheduler: via SCHEDULER_URL secrets\n"
+          ).format(
+              slot=m.get("slot", "?"),
+              email=m.get("email") or "?",
+              status=m.get("status") or "?",
+              probe_ok=m.get("probe_ok", 0),
+              probe_fail=m.get("probe_fail", 0),
+              reg_fail=m.get("reg_fail", 0),
+              importable=m.get("importable", 0),
+              uploaded=m.get("uploaded", 0),
+              upload_ok=m.get("upload_ok", False),
           )
-          for r in lines:
-              md += (
-                  f"- email={r.get('email','?')} status={r.get('status')} "
-                  f"code={r.get('code')} usable={r.get('usable')}\n"
-              )
           summary = os.environ.get("GITHUB_STEP_SUMMARY")
           if summary:
               pathlib.Path(summary).write_text(md, encoding="utf-8")
-          # ascii-safe console print
           print(md.encode("ascii", errors="replace").decode("ascii"))
           PY
 
@@ -245,12 +390,27 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: register-windows-${{ github.run_id }}
+          name: register-windows-${{ github.run_id }}-slot-${{ inputs.slot || '1' }}
           path: |
             results.jsonl
             accounts.txt
             importable.json
             importable.jsonl
+            upload_result.json
+            metrics.json
             g2a_auth/
             diag/
           if-no-files-found: warn
+
+      - name: Fail job if register not usable
+        if: always()
+        shell: bash
+        run: |
+          python <<'PY'
+          import json, pathlib, sys
+          m = {}
+          if pathlib.Path("metrics.json").exists():
+              m = json.loads(pathlib.Path("metrics.json").read_text(encoding="utf-8"))
+          ok = int(m.get("probe_ok") or 0) > 0
+          sys.exit(0 if ok else 1)
+          PY
