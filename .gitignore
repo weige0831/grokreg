@@ -8,6 +8,8 @@ __pycache__/
 config.json
 accounts*.txt
 results*.jsonl
+importable.json
+importable.jsonl
 cpa_auths/
 *.log
 .DS_Store
@@ -15,10 +17,7 @@ auth_out/
 tmp/
 .chrome*/
 chromium_user_data/
-
 scheduler/
-
-
-Ñש±¾/
 samples/
-
+# local sample tree (Chinese folder name may be present on disk)
+**/__MACOSX/
