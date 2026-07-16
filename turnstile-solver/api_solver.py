@@ -622,32 +622,60 @@ class TurnstileAPIServer:
 
 
     async def _optimized_route_handler(self, route):
-        """Оптимизированный обработчик маршрутов для экономии ресурсов."""
+        """Route filter for Turnstile — must not starve CF widget assets."""
+        # Full pass-through when TURNSTILE_NO_BLOCK=1 (recommended on GHA Camoufox).
+        no_block = (os.getenv("TURNSTILE_NO_BLOCK", "") or "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if no_block:
+            await route.continue_()
+            return
+
         url = route.request.url
         resource_type = route.request.resource_type
 
-        allowed_types = {'document', 'script', 'xhr', 'fetch'}
+        # stylesheet/image/font needed for CF widget paint + challenge UI
+        allowed_types = {
+            "document", "script", "xhr", "fetch",
+            "stylesheet", "image", "font", "ping", "other",
+        }
 
         allowed_domains = [
-            'challenges.cloudflare.com',
-            'static.cloudflareinsights.com',
-            'cloudflare.com'
+            "challenges.cloudflare.com",
+            "static.cloudflareinsights.com",
+            "cloudflare.com",
+            "accounts.x.ai",
+            "x.ai",
+            "cdn-cgi",
         ]
-        
+
         if resource_type in allowed_types:
             await route.continue_()
         elif any(domain in url for domain in allowed_domains):
-            await route.continue_() 
+            await route.continue_()
         else:
             await route.abort()
 
     async def _block_rendering(self, page):
-        """Блокировка рендеринга для экономии ресурсов"""
+        """Optional resource filter (disabled when TURNSTILE_NO_BLOCK=1)."""
+        no_block = (os.getenv("TURNSTILE_NO_BLOCK", "") or "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if no_block:
+            if self.debug:
+                logger.debug("resource block disabled (TURNSTILE_NO_BLOCK)")
+            return
         await page.route("**/*", self._optimized_route_handler)
 
     async def _unblock_rendering(self, page):
-        """Разблокировка рендеринга"""
-        await page.unroute("**/*", self._optimized_route_handler)
+        """Remove resource filter if any."""
+        try:
+            await page.unroute("**/*", self._optimized_route_handler)
+        except Exception:
+            try:
+                await page.unroute("**/*")
+            except Exception:
+                pass
 
     async def _find_turnstile_elements(self, page, index: int):
         """Умная проверка всех возможных Turnstile элементов"""
@@ -848,6 +876,8 @@ class TurnstileAPIServer:
                                 {f'cdata: "{cdata}",' if cdata else ''}
                                 callback: function(token) {{
                                     console.log('Turnstile solved with token:', token);
+                                    window.__turnstileToken = token;
+                                    window.__cf_turnstile_token = token;
                                     // Create hidden input for token
                                     let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
                                     if (!tokenInput) {{
@@ -860,10 +890,12 @@ class TurnstileAPIServer:
                                 }},
                                 'error-callback': function(error) {{
                                     console.log('Turnstile error:', error);
+                                    window.__turnstileError = String(error);
                                 }}
                             }});
                         }} catch (e) {{
                             console.log('Turnstile render error:', e);
+                            window.__turnstileError = String(e);
                         }}
                     }} else {{
                         console.log('Turnstile API not available');
@@ -872,6 +904,7 @@ class TurnstileAPIServer:
             }};
             script.onerror = function() {{
                 console.log('Failed to load Turnstile script');
+                window.__turnstileError = 'script_load_failed';
             }};
             document.head.appendChild(script);
         }};
@@ -886,6 +919,8 @@ class TurnstileAPIServer:
                     {f'cdata: "{cdata}",' if cdata else ''}
                     callback: function(token) {{
                         console.log('Turnstile solved with token:', token);
+                        window.__turnstileToken = token;
+                        window.__cf_turnstile_token = token;
                         let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
                         if (!tokenInput) {{
                             tokenInput = document.createElement('input');
@@ -897,6 +932,7 @@ class TurnstileAPIServer:
                     }},
                     'error-callback': function(error) {{
                         console.log('Turnstile error:', error);
+                        window.__turnstileError = String(error);
                     }}
                 }});
             }} catch (e) {{
@@ -910,6 +946,16 @@ class TurnstileAPIServer:
         // Setup global callback
         window.onTurnstileCallback = function(token) {{
             console.log('Global turnstile callback executed:', token);
+            window.__turnstileToken = token;
+            window.__cf_turnstile_token = token;
+            let tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
+            if (!tokenInput) {{
+                tokenInput = document.createElement('input');
+                tokenInput.type = 'hidden';
+                tokenInput.name = 'cf-turnstile-response';
+                document.body.appendChild(tokenInput);
+            }}
+            tokenInput.value = token;
         }};
         """
 
@@ -1139,75 +1185,104 @@ class TurnstileAPIServer:
                     logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
 
                 await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
-                await asyncio.sleep(3)
+                # Give widget time to load + auto-solve before hammering clicks
+                await asyncio.sleep(5)
 
                 locator = page.locator('input[name="cf-turnstile-response"]')
-                max_attempts = 30
+                max_attempts = 45
                 click_count = 0
-                max_clicks = 10
+                max_clicks = 8
+
+                async def _read_token() -> str:
+                    # 1) hidden inputs
+                    try:
+                        count = await locator.count()
+                    except Exception:
+                        count = 0
+                    for i in range(max(count, 0)):
+                        try:
+                            val = await locator.nth(i).input_value(timeout=400)
+                            if val and len(val) > 20:
+                                return val
+                        except Exception:
+                            continue
+                    # 2) JS globals set by our callback
+                    try:
+                        js_tok = await page.evaluate(
+                            """() => {
+                              return window.__turnstileToken
+                                || window.__cf_turnstile_token
+                                || (document.querySelector('input[name="cf-turnstile-response"]')||{}).value
+                                || '';
+                            }"""
+                        )
+                        if isinstance(js_tok, str) and len(js_tok) > 20:
+                            return js_tok
+                    except Exception:
+                        pass
+                    return ""
 
                 for attempt in range(max_attempts):
                     try:
-                        try:
-                            count = await locator.count()
-                        except Exception as e:
-                            if self.debug:
-                                logger.debug(f"Browser {index}: Locator count failed on attempt {attempt + 1}: {str(e)}")
-                            count = 0
+                        token = await _read_token()
+                        if token:
+                            elapsed_time = round(time.time() - start_time, 3)
+                            logger.success(
+                                f"Browser {index}: Successfully solved captcha - "
+                                f"{COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in "
+                                f"{COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds"
+                            )
+                            await save_result(
+                                task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time}
+                            )
+                            return
 
-                        if count == 0:
-                            if self.debug and attempt % 5 == 0:
-                                logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
-                        elif count == 1:
-                            try:
-                                token = await locator.input_value(timeout=500)
-                                if token:
-                                    elapsed_time = round(time.time() - start_time, 3)
-                                    logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                    await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
-                                    return
-                            except Exception as e:
-                                if self.debug:
-                                    logger.debug(f"Browser {index}: Single token element check failed: {str(e)}")
-                        else:
-                            if self.debug:
-                                logger.debug(f"Browser {index}: Found {count} token elements, checking all")
-                            for i in range(count):
-                                try:
-                                    element_token = await locator.nth(i).input_value(timeout=500)
-                                    if element_token:
-                                        elapsed_time = round(time.time() - start_time, 3)
-                                        logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                        await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
-                                        return
-                                except Exception as e:
-                                    if self.debug:
-                                        logger.debug(f"Browser {index}: Token element {i} check failed: {str(e)}")
-                                    continue
-
-                        if attempt > 2 and attempt % 3 == 0 and click_count < max_clicks:
+                        # first few rounds: wait for auto-solve; then click sparingly
+                        if attempt >= 4 and attempt % 4 == 0 and click_count < max_clicks:
                             click_success = await self._try_click_strategies(page, index)
                             click_count += 1
-                            if click_success and self.debug:
-                                logger.debug(f"Browser {index}: Click successful (click #{click_count}/{max_clicks})")
-                            elif not click_success and self.debug:
-                                logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1} (click #{click_count}/{max_clicks})")
-
-                        wait_time = min(0.5 + (attempt * 0.05), 2.0)
-                        await asyncio.sleep(wait_time)
+                            if self.debug:
+                                logger.debug(
+                                    f"Browser {index}: click #{click_count}/{max_clicks} "
+                                    f"ok={click_success}"
+                                )
 
                         if self.debug and attempt % 5 == 0:
-                            logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - Waiting for token (clicks: {click_count}/{max_clicks})")
+                            err = ""
+                            try:
+                                err = await page.evaluate("() => window.__turnstileError || ''")
+                            except Exception:
+                                pass
+                            logger.debug(
+                                f"Browser {index}: Attempt {attempt + 1}/{max_attempts} "
+                                f"waiting token (clicks={click_count}) err={err!r}"
+                            )
 
+                        await asyncio.sleep(min(0.6 + attempt * 0.04, 2.0))
                     except Exception as e:
                         if self.debug:
                             logger.debug(f"Browser {index}: Attempt {attempt + 1} error: {str(e)}")
                         continue
 
                 elapsed_time = round(time.time() - start_time, 3)
-                await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": "timeout"})
+                fail_err = "timeout"
+                try:
+                    fail_err = await page.evaluate(
+                        "() => window.__turnstileError || 'timeout'"
+                    ) or "timeout"
+                except Exception:
+                    pass
+                await save_result(
+                    task_id,
+                    "turnstile",
+                    {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(fail_err)},
+                )
                 if self.debug:
-                    logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                    logger.error(
+                        f"Browser {index}: Error solving Turnstile in "
+                        f"{COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds "
+                        f"({fail_err})"
+                    )
             except Exception as e:
                 elapsed_time = round(time.time() - start_time, 3)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)})

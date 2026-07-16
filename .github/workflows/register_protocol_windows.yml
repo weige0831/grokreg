@@ -144,12 +144,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           XDG_CACHE_HOME: ${{ github.workspace }}/turnstile-solver/cache
           PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/turnstile-solver/cache/ms-playwright
+          # Do not starve CF widget assets on GHA
+          TURNSTILE_NO_BLOCK: "1"
         run: |
           cd turnstile-solver
           export PYTHONIOENCODING=utf-8
           export PYTHONUTF8=1
           export XDG_CACHE_HOME="$(pwd)/cache"
           export PLAYWRIGHT_BROWSERS_PATH="$(pwd)/cache/ms-playwright"
+          export TURNSTILE_NO_BLOCK=1
           # ensure playwright patch still applied
           .venv/Scripts/python patch_playwright_ff_pageerror.py || true
           nohup .venv/Scripts/python -X utf8 api_solver.py \
@@ -233,6 +236,7 @@ jobs:
           PYTHONUTF8: "1"
           XDG_CACHE_HOME: ${{ github.workspace }}/turnstile-solver/cache
           PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/turnstile-solver/cache/ms-playwright
+          TURNSTILE_NO_BLOCK: "1"
         shell: bash
         run: |
           # Proxy optional: empty = use GHA direct egress (fine if IP passes CF).
