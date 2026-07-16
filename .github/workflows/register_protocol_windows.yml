@@ -73,10 +73,9 @@ jobs:
       - name: Install project
         run: uv sync
 
-      # Windows GHA: Camoufox/Playwright can crash mid-solve
-      # (pageError.location.url undefined). Prefer chromium via patchright;
-      # proxy is optional — GHA egress can pass CF without PROXY_URL.
-      - name: Install local Turnstile solver (chromium)
+      # Keep Camoufox on GHA. Fix Playwright FF pageError.location crash via patch.
+      # Proxy optional — GHA direct egress is fine when IP passes CF.
+      - name: Install local Camoufox turnstile solver
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -89,53 +88,77 @@ jobs:
           .venv/Scripts/python -m pip install -U pip setuptools wheel
           .venv/Scripts/python -m pip install -r requirements.txt
           mkdir -p logs cache
+          export XDG_CACHE_HOME="$(pwd)/cache"
           export PLAYWRIGHT_BROWSERS_PATH="$(pwd)/cache/ms-playwright"
-          mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
-          # chromium for Windows GHA (more stable than camoufox here)
+          mkdir -p "$XDG_CACHE_HOME" "$PLAYWRIGHT_BROWSERS_PATH"
+          # Patch Playwright Firefox driver BEFORE first browser use
+          .venv/Scripts/python patch_playwright_ff_pageerror.py || true
+          # camoufox browser binary (needs GitHub API — use GITHUB_TOKEN)
           ok=0
-          for attempt in 1 2 3; do
-            echo "patchright install chromium attempt $attempt..."
-            if .venv/Scripts/python -m patchright install chromium; then
+          for attempt in 1 2 3 4 5; do
+            echo "camoufox fetch attempt $attempt..."
+            if .venv/Scripts/python -m camoufox fetch; then
               ok=1
               break
             fi
-            sleep $((attempt * 8))
+            echo "fetch failed, sleep $((attempt * 10))s"
+            sleep $((attempt * 10))
           done
           if [ "$ok" != "1" ]; then
-            echo "patchright chromium install failed"
+            echo "camoufox fetch failed after retries"
             exit 1
           fi
+          # re-patch after fetch in case playwright files were refreshed
+          .venv/Scripts/python patch_playwright_ff_pageerror.py || true
           .venv/Scripts/python - <<'PY'
+          import os, sys
           from pathlib import Path
-          import os
-          root = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "cache/ms-playwright")
-          hits = list(root.rglob("chrome.exe")) + list(root.rglob("chromium.exe"))
-          print("chromium hits", len(hits), hits[:3])
+          roots = [
+              Path(os.environ.get("XDG_CACHE_HOME") or "") / "camoufox",
+              Path.home() / ".cache" / "camoufox",
+              Path(os.environ.get("LOCALAPPDATA") or "") / "camoufox",
+              Path("cache"),
+          ]
+          hits = []
+          for root in roots:
+              if not root or not str(root) or not root.exists():
+                  continue
+              for p in root.rglob("*"):
+                  n = p.name.lower()
+                  if p.is_file() and n in ("camoufox.exe", "firefox.exe", "camoufox", "firefox"):
+                      hits.append(str(p))
+          print("camoufox binary hits", len(hits), hits[:3])
           if not hits:
-              raise SystemExit("chromium binary missing after install")
-          print("chromium OK")
+              print("ERROR: camoufox browser binary not found")
+              sys.exit(1)
+          print("camoufox binary OK")
           PY
 
-      - name: Start local Turnstile solver
+      - name: Start local Camoufox solver
         shell: bash
         env:
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"
           PYTHONLEGACYWINDOWSSTDIO: "0"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          XDG_CACHE_HOME: ${{ github.workspace }}/turnstile-solver/cache
           PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/turnstile-solver/cache/ms-playwright
         run: |
           cd turnstile-solver
           export PYTHONIOENCODING=utf-8
           export PYTHONUTF8=1
+          export XDG_CACHE_HOME="$(pwd)/cache"
           export PLAYWRIGHT_BROWSERS_PATH="$(pwd)/cache/ms-playwright"
-          # chromium headless, no proxy required on GHA
+          # ensure playwright patch still applied
+          .venv/Scripts/python patch_playwright_ff_pageerror.py || true
           nohup .venv/Scripts/python -X utf8 api_solver.py \
-            --browser_type chromium --thread 1 --host 127.0.0.1 --port 5072 --debug \
+            --browser_type camoufox --thread 1 --host 127.0.0.1 --port 5072 --debug \
             > logs/solver.log 2>&1 &
           echo $! > logs/solver.pid
           for i in $(seq 1 90); do
             if curl -fsS http://127.0.0.1:5072/health >/dev/null 2>&1; then
-              echo "local solver ready (chromium)"
+              echo "local solver ready (camoufox)"
               curl -sS http://127.0.0.1:5072/health || true
               exit 0
             fi
@@ -483,7 +506,7 @@ jobs:
               m = json.loads(pathlib.Path("metrics.json").read_text(encoding="utf-8"))
           md = (
               "## register-protocol-windows (slot {slot})\n"
-              "- engine: protocol + local Turnstile solver (chromium on GHA)\n"
+              "- engine: protocol + Camoufox local solver (GHA)\n"
               "- email: {email}\n"
               "- status: {status}\n"
               "- probe_ok: {probe_ok}\n"

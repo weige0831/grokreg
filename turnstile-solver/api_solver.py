@@ -276,7 +276,17 @@ class TurnstileAPIServer:
             playwright = await async_playwright().start()
             self._playwright = playwright
         elif self.browser_type == "camoufox":
-            camoufox = AsyncCamoufox(headless=self.headless)
+            # Windows GHA: prefer plain headless; virtual display is Linux-oriented.
+            cf_kwargs: dict = {"headless": self.headless}
+            # Reduce noisy page scripts that can trip Playwright Firefox pageError bugs.
+            try:
+                cf_kwargs["firefox_user_prefs"] = {
+                    "dom.webdriver.enabled": False,
+                    "useAutomationExtension": False,
+                }
+            except Exception:
+                pass
+            camoufox = AsyncCamoufox(**cf_kwargs)
             self._camoufox = camoufox
 
         browser_configs = []
@@ -1077,6 +1087,14 @@ class TurnstileAPIServer:
 
             page = await context.new_page()
 
+            # Swallow pageerrors early — Playwright Firefox can crash the whole Node
+            # driver when pageError.location is undefined (GHA Windows Camoufox).
+            try:
+                page.on("pageerror", lambda _exc: None)
+                page.on("crash", lambda: logger.warning(f"Browser {index}: page crash event"))
+            except Exception:
+                pass
+
             try:
                 await page.set_viewport_size({"width": 500, "height": 100})
             except Exception:
@@ -1094,6 +1112,18 @@ class TurnstileAPIServer:
             loadTimes: function() {},
             csi: function() {},
         };
+
+        // Prevent uncaught page errors from reaching Playwright Firefox driver
+        // (location-less errors can crash coreBundle.js on Windows GHA).
+        try {
+          window.addEventListener('error', function(e) {
+            try { e.preventDefault(); e.stopImmediatePropagation(); } catch (_) {}
+            return true;
+          }, true);
+          window.addEventListener('unhandledrejection', function(e) {
+            try { e.preventDefault(); e.stopImmediatePropagation(); } catch (_) {}
+          }, true);
+        } catch (_) {}
         """)
 
             try:
