@@ -29,6 +29,12 @@ DEFAULTS: dict[str, Any] = {
     "turnstile_stuck_timeout": 150,
     "mint_proxy": "",
     "browser_engine": "drission",
+    # protocol mode (HTTP signup + Build OAuth, based on xconsole_client)
+    "yescaptcha_api_key": "",
+    "yescaptcha_premium": True,
+    "protocol_build_oauth": True,
+    "protocol_debug": False,
+    "g2a_auth_dir": "g2a_auth",
     "browser_use_proxy": False,
     "browser_proxy": "",
     "browser_set_user_agent": False,
@@ -90,6 +96,7 @@ def _env_override(cfg: dict[str, Any]) -> dict[str, Any]:
         "GROK2API_APP_KEY": "grok2api_remote_app_key",
         "GROK2API_POOL": "grok2api_pool_name",
         "TEMPMAIL_BASE_URL": "tempmail_base_url",
+        "YESCAPTCHA_API_KEY": "yescaptcha_api_key",
     }
     for env_k, cfg_k in mapping.items():
         v = os.environ.get(env_k, "").strip()

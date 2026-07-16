@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any
 
 from grokreg.browser import BrowserRegisterError, create_registrar
+
+try:
+    from grokreg.protocol.register import ProtocolRegisterError
+except Exception:  # pragma: no cover
+    ProtocolRegisterError = BrowserRegisterError  # type: ignore
 from grokreg.config import load_config, resolve_proxy
 from grokreg.probe.build45 import mint_and_probe
 from grokreg.probe.web_chat import probe_web_default_model
@@ -412,7 +417,7 @@ def run_register(
                 row["idx"] = i
                 if acc.get("fingerprint"):
                     row["fingerprint"] = acc.get("fingerprint")
-            except BrowserRegisterError as exc:
+            except (BrowserRegisterError, ProtocolRegisterError) as exc:
                 wlog(f"register failed: {exc}")
                 row["error"] = str(exc)[:500]
                 row["code"] = "reg_fail"

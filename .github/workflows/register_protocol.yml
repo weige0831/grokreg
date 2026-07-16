@@ -1,0 +1,152 @@
+name: register-protocol
+
+# Protocol mode: HTTP signup + Build OAuth + probe (no browser UI).
+# Requires secrets: PROXY_URL, TEMPMAIL_BASE_URL, YESCAPTCHA_API_KEY
+# Optional: SCHEDULER_* for frontend upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "Accounts to register"
+        required: true
+        default: "1"
+      domains:
+        description: "Tempmail domains (comma-separated)"
+        required: false
+        default: "mtoosov.shop,olsbvgq.shop,htazmbb.shop"
+
+jobs:
+  protocol-register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup uv / Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project
+        run: uv sync
+
+      - name: Write config
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          TEMPMAIL_BASE_URL: ${{ secrets.TEMPMAIL_BASE_URL }}
+          YESCAPTCHA_API_KEY: ${{ secrets.YESCAPTCHA_API_KEY }}
+          TEMPMAIL_DOMAINS: ${{ inputs.domains }}
+        run: |
+          python <<'PY'
+          import json, os, re
+          cfg = json.load(open("config.example.json", encoding="utf-8"))
+          cfg["proxy"] = os.environ.get("PROXY_URL") or ""
+          if os.environ.get("TEMPMAIL_BASE_URL"):
+              cfg["tempmail_base_url"] = os.environ["TEMPMAIL_BASE_URL"]
+          cfg["yescaptcha_api_key"] = os.environ.get("YESCAPTCHA_API_KEY") or ""
+          cfg["browser_engine"] = "protocol"
+          cfg["protocol_build_oauth"] = True
+          cfg["register_count"] = int("${{ inputs.count }}" or "1")
+          cfg["grok2api_auto_add_remote"] = False
+          raw = (os.environ.get("TEMPMAIL_DOMAINS") or "").strip()
+          default_domains = ["mtoosov.shop", "olsbvgq.shop", "htazmbb.shop"]
+          domains = []
+          if raw:
+              for part in re.split(r"[,;\s]+", raw):
+                  d = part.strip().lower().lstrip("@")
+                  if d and d not in domains:
+                      domains.append(d)
+          cfg["tempmail_domains"] = domains or default_domains
+          json.dump(cfg, open("config.json", "w", encoding="utf-8"), indent=2)
+          print("protocol config domains=%s yescaptcha=%s" % (
+              cfg["tempmail_domains"], bool(cfg["yescaptcha_api_key"])
+          ))
+          PY
+
+      - name: Run protocol register
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          YESCAPTCHA_API_KEY: ${{ secrets.YESCAPTCHA_API_KEY }}
+          TEMPMAIL_DOMAINS: ${{ inputs.domains }}
+        run: uv run python -m grokreg protocol-run --count ${{ inputs.count }}
+
+      - name: Build importable + upload scheduler
+        if: always()
+        env:
+          SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
+          SCHEDULER_USER: ${{ secrets.SCHEDULER_USER }}
+          SCHEDULER_PASS: ${{ secrets.SCHEDULER_PASS }}
+          SCHEDULER_TOKEN: ${{ secrets.SCHEDULER_TOKEN }}
+        run: |
+          python <<'PY'
+          import json, os, pathlib, sys, urllib.error, urllib.request
+          side = pathlib.Path("importable.jsonl")
+          lines = []
+          if side.exists():
+              for line in side.read_text(encoding="utf-8").splitlines():
+                  try:
+                      it = json.loads(line)
+                  except Exception:
+                      continue
+                  it.setdefault("source", "gha-protocol")
+                  tags = list(it.get("tags") or [])
+                  for t in ("protocol", "gha", "no-upload"):
+                      if t not in tags:
+                          tags.append(t)
+                  it["tags"] = tags
+                  lines.append(it)
+          pathlib.Path("importable.json").write_text(
+              json.dumps(lines, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          print("importable", len(lines))
+          base = (os.environ.get("SCHEDULER_URL") or "").rstrip("/")
+          if not base or not lines:
+              print("skip scheduler upload")
+              sys.exit(0)
+          def req(method, url, data=None, token=""):
+              body = None if data is None else json.dumps(data).encode()
+              h = {"Content-Type": "application/json"}
+              if token:
+                  h["Authorization"] = f"Bearer {token}"
+              r = urllib.request.Request(url, data=body, headers=h, method=method)
+              with urllib.request.urlopen(r, timeout=60) as resp:
+                  return json.loads(resp.read().decode() or "{}")
+          token = (os.environ.get("SCHEDULER_TOKEN") or "").strip()
+          if not token:
+              login = req("POST", f"{base}/api/auth/login", {
+                  "username": os.environ.get("SCHEDULER_USER") or "admin",
+                  "password": os.environ.get("SCHEDULER_PASS") or "",
+              })
+              token = login.get("token") or ""
+          if not token:
+              print("no scheduler token")
+              sys.exit(0)
+          payload = {"accounts": [{
+              "email": a.get("email") or "",
+              "password": a.get("password") or "",
+              "sso": a.get("sso") or "",
+              "access_token": a.get("access_token") or "",
+              "refresh_token": a.get("refresh_token") or "",
+              "id_token": a.get("id_token") or "",
+              "probe_status": int(a.get("probe_status") or 200),
+              "probe_detail": a.get("probe_detail") or "probe_ok",
+              "tags": a.get("tags") or ["protocol"],
+              "source": a.get("source") or "gha-protocol",
+          } for a in lines]}
+          res = req("POST", f"{base}/api/accounts/import", payload, token=token)
+          print("import", res)
+          PY
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-register-${{ github.run_id }}
+          path: |
+            results.jsonl
+            accounts.txt
+            importable.json
+            importable.jsonl
+            g2a_auth/
+          if-no-files-found: warn

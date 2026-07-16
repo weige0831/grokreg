@@ -18,6 +18,17 @@ def main(argv: list[str] | None = None) -> int:
     p_run = sub.add_parser("run", help="register + probe + upload")
     p_run.add_argument("--count", type=int, default=0, help="how many accounts (0=config)")
     p_run.add_argument("--extra", type=int, default=0, help="alias of --count")
+    p_run.add_argument(
+        "--engine",
+        default="",
+        help="browser_engine override: protocol | drission | cloak",
+    )
+
+    p_proto = sub.add_parser(
+        "protocol-run",
+        help="protocol register + Build OAuth + probe (no browser UI)",
+    )
+    p_proto.add_argument("--count", type=int, default=1, help="how many accounts")
 
     p_pu = sub.add_parser("probe-upload", help="probe existing accounts then upload Build")
     p_pu.add_argument("--accounts", default="", help="accounts file")
@@ -29,11 +40,28 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config or None)
 
     if args.cmd == "run":
+        if getattr(args, "engine", ""):
+            cfg["browser_engine"] = str(args.engine).strip()
         n = args.count or args.extra or 0
         results = run_register(cfg, count=n or None, log=default_log)
         if not results:
             return 1
         # success if any usable / probe_ok (upload optional when auto_add disabled)
+        ok = sum(
+            1
+            for r in results
+            if r.get("usable") is True
+            or r.get("status") in {"probe_ok", "upload_ok", "upload_fail"}
+        )
+        return 0 if ok else 1
+
+    if args.cmd == "protocol-run":
+        cfg["browser_engine"] = "protocol"
+        cfg["protocol_build_oauth"] = True
+        # protocol path already embeds Build token as web_pre/build_web_pre style
+        results = run_register(cfg, count=max(1, int(args.count or 1)), log=default_log)
+        if not results:
+            return 1
         ok = sum(
             1
             for r in results

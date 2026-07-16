@@ -3,4 +3,5 @@ DrissionPage>=4.1
 cloakbrowser>=0.4.0
 playwright>=1.40
 psutil>=5.9
+requests>=2.31
 pytest>=8.0
