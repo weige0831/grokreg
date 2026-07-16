@@ -38,8 +38,13 @@ DEFAULTS: dict[str, Any] = {
     "mint_proxy": "",
     "browser_engine": "drission",
     # protocol mode (HTTP signup + Build OAuth, based on xconsole_client)
+    # captcha: local=Camoufox turnstile-solver (default); yescaptcha=remote paid
+    "captcha_provider": "local",
+    "local_solver_url": "http://127.0.0.1:5072",
+    "local_solver_wait_sec": 120,
+    "local_solver_timeout": 120,
     "yescaptcha_api_key": "",
-    "yescaptcha_premium": True,
+    "yescaptcha_premium": False,
     "protocol_build_oauth": True,
     "protocol_debug": False,
     "g2a_auth_dir": "g2a_auth",

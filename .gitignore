@@ -28,5 +28,9 @@ tmp/
 chromium_user_data/
 scheduler/
 samples/
+turnstile-solver/.venv/
+turnstile-solver/logs/
+turnstile-solver/keys/
+turnstile-solver/**/__pycache__/
 # local sample tree (Chinese folder name may be present on disk)
 **/__MACOSX/

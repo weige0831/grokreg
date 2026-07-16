@@ -2,9 +2,11 @@
 """Protocol register: x.ai signup (HTTP) + Build OAuth + probe.
 
 Based on edi/grokv2/app/grok-build-auth (xconsole_client).
+Captcha: Camoufox local solver by default (YesCaptcha-compatible API on :5072).
 """
 from __future__ import annotations
 
+import json
 import os
 import random
 import string
@@ -16,6 +18,11 @@ from typing import Any
 from grokreg.mail.tempmail import TempMailClient, TempMailError
 from grokreg.mint.auth_code import token_to_cpa_record
 from grokreg.probe.build45 import probe_chat_completions, probe_responses
+from grokreg.protocol.local_solver import (
+    local_solver_url,
+    pin_local_solver_env,
+    wait_for_local_solver,
+)
 from grokreg.util.log import LogFn, default_log
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
@@ -45,7 +52,6 @@ class ProtocolRegistrar:
         self._client = None
 
     def start(self) -> None:
-        # lazy per-account client
         return
 
     def stop(self) -> None:
@@ -60,24 +66,62 @@ class ProtocolRegistrar:
         self.stop()
         self.start()
 
-    def register_one(self) -> dict[str, Any]:
-        """signup → sso → protocol Build OAuth → optional probe fields."""
+    def _make_solver(self, *, proxy: str, debug: bool):
+        """Camoufox local solver (default) or optional YesCaptcha remote."""
+        from grokreg.protocol.xconsole_client import YesCaptchaSolver
+
+        provider = str(self.cfg.get("captcha_provider") or "local").strip().lower()
+        if provider in {"local", "camoufox", "solver"}:
+            endpoint = local_solver_url(self.cfg)
+            pin_local_solver_env(endpoint)
+            wait_sec = float(self.cfg.get("local_solver_wait_sec") or 120)
+            ready = wait_for_local_solver(
+                endpoint,
+                timeout_sec=wait_sec,
+                poll_sec=1.0,
+                log=self.log,
+            )
+            if not ready.get("ready"):
+                raise ProtocolRegisterError(
+                    ready.get("error")
+                    or f"本地 Camoufox 过盾未就绪: {endpoint}。"
+                    "请先启动: cd turnstile-solver && bash start.sh"
+                )
+            self.log(f"[proto] captcha=local Camoufox {endpoint}")
+            return YesCaptchaSolver(
+                "local",
+                endpoint=endpoint,
+                timeout=float(self.cfg.get("local_solver_timeout") or 120),
+                poll_interval=1.0,
+                debug=debug,
+                auto_fallback_endpoint=False,
+            ), "local"
+
+        # optional remote YesCaptcha (explicit only)
         ykey = (
             str(self.cfg.get("yescaptcha_api_key") or "").strip()
             or os.environ.get("YESCAPTCHA_API_KEY", "").strip()
-            or os.environ.get("GROK2API_YESCAPTCHA_API_KEY", "").strip()
         )
         if not ykey:
             raise ProtocolRegisterError(
-                "yescaptcha_api_key / YESCAPTCHA_API_KEY required for protocol register"
+                "captcha_provider=yescaptcha 需要 yescaptcha_api_key；"
+                "默认请用 local Camoufox（captcha_provider=local）"
             )
+        self.log("[proto] captcha=yescaptcha remote")
+        return YesCaptchaSolver(
+            ykey,
+            timeout=180,
+            poll_interval=2.0,
+            debug=debug,
+        ), "yescaptcha"
 
+    def register_one(self) -> dict[str, Any]:
+        """signup → sso → protocol Build OAuth → probe."""
         proxy = str(self.cfg.get("proxy") or self.cfg.get("mint_proxy") or "").strip()
         debug = bool(self.cfg.get("protocol_debug", False))
 
-        # local package path: grokreg.protocol.xconsole_client
         try:
-            from grokreg.protocol.xconsole_client import XConsoleAuthClient, YesCaptchaSolver
+            from grokreg.protocol.xconsole_client import XConsoleAuthClient
             from grokreg.protocol.xconsole_client import config as xc_config
             from grokreg.protocol.xconsole_client.oauth_protocol import (
                 extract_cookies_from_auth_client,
@@ -85,6 +129,17 @@ class ProtocolRegistrar:
             )
         except Exception as exc:
             raise ProtocolRegisterError(f"xconsole_client import failed: {exc}") from exc
+
+        solver, captcha_mode = self._make_solver(proxy=proxy, debug=debug)
+        # pin env so oauth_protocol's internal YesCaptchaSolver also hits local
+        if captcha_mode == "local":
+            pin_local_solver_env(local_solver_url(self.cfg))
+            ykey_for_oauth = "local"
+        else:
+            ykey_for_oauth = (
+                str(self.cfg.get("yescaptcha_api_key") or "").strip()
+                or os.environ.get("YESCAPTCHA_API_KEY", "").strip()
+            )
 
         mail = TempMailClient(
             base_url=str(self.cfg.get("tempmail_base_url") or "https://mail.minecraft-cn.net"),
@@ -101,7 +156,7 @@ class ProtocolRegistrar:
         for attempt in range(1, max_attempts + 1):
             client = None
             try:
-                self.log(f"[proto] attempt {attempt}/{max_attempts}")
+                self.log(f"[proto] attempt {attempt}/{max_attempts} captcha={captcha_mode}")
                 client = XConsoleAuthClient(
                     debug=debug,
                     proxy=proxy or None,
@@ -109,12 +164,10 @@ class ProtocolRegistrar:
                 )
                 self._client = client
 
-                # 1) warm + scrape
                 self.log("[proto] visit_home + load_signup_page")
                 client.visit_home()
                 client.load_signup_page()
 
-                # 2) email + code
                 email, token = mail.create_address()
                 password = _rand_password()
                 first, last = _rand_name()
@@ -125,22 +178,23 @@ class ProtocolRegistrar:
                 client.verify_email_validation_code(email, code)
                 client.validate_password(email, password)
 
-                # 3) turnstile
                 sitekey = (
                     getattr(client, "turnstile_sitekey", None)
                     or getattr(xc_config, "TURNSTILE_SITEKEY", None)
                     or "0x4AAAAAAAhr9JGVDZbrZOo0"
                 )
-                solver = YesCaptchaSolver(ykey, debug=debug)
-                self.log(f"[proto] solve turnstile sitekey={str(sitekey)[:20]}...")
+                self.log(f"[proto] solve turnstile ({captcha_mode}) sitekey={str(sitekey)[:20]}...")
+                # local: no premium; pass proxy so CF token egress matches protocol IP
                 turnstile = solver.solve_turnstile(
                     website_url=SIGNUP_URL,
                     website_key=str(sitekey),
-                    premium=bool(self.cfg.get("yescaptcha_premium", True)),
+                    premium=bool(self.cfg.get("yescaptcha_premium", False))
+                    if captcha_mode != "local"
+                    else False,
+                    proxy=proxy or None,
                 )
                 self.log(f"[proto] turnstile len={len(turnstile or '')}")
 
-                # 4) create account
                 res = client.create_account(
                     email=email,
                     given_name=first,
@@ -157,7 +211,6 @@ class ProtocolRegistrar:
                     )
                 self.log("[proto] account created")
 
-                # 5) SSO
                 sso = client.fetch_sso_token(email=email, password=password, save=False, retries=3)
                 if not sso:
                     raise ProtocolRegisterError("SSO extraction failed")
@@ -169,17 +222,20 @@ class ProtocolRegistrar:
                     "sso": sso,
                     "profile": {"given_name": first, "family_name": last, "password": password},
                     "engine": "protocol",
+                    "captcha": captcha_mode,
                 }
 
-                # 6) Build OAuth (protocol) + probe
                 if bool(self.cfg.get("protocol_build_oauth", True)):
                     session_cookies = extract_cookies_from_auth_client(client) or {}
                     session_cookies.setdefault("sso", sso)
                     self.log("[proto] Build OAuth (protocol)…")
+                    # ensure oauth path also uses local solver endpoint via env
+                    if captcha_mode == "local":
+                        pin_local_solver_env(local_solver_url(self.cfg))
                     oauth = login_with_protocol(
                         email,
                         password,
-                        yescaptcha_key=ykey,
+                        yescaptcha_key=ykey_for_oauth or "local",
                         proxy=proxy,
                         debug=debug,
                         session_cookies=session_cookies,
@@ -204,7 +260,6 @@ class ProtocolRegistrar:
                         "token": token_dict,
                         "method": "protocol_oauth",
                     }
-                    # light probe
                     pr = probe_responses(
                         access,
                         base_url=str(self.cfg.get("probe_base_url") or "https://cli-chat-proxy.grok.com/v1"),
@@ -223,7 +278,6 @@ class ProtocolRegistrar:
                         if pr2.get("ok"):
                             pr = pr2
                     out["probe"] = pr
-                    # skip browser web pre — protocol path does not do UI chat
                     out["web"] = {
                         "ok": True,
                         "code": "web_skipped_protocol",
@@ -231,17 +285,14 @@ class ProtocolRegistrar:
                         "method": "protocol",
                         "detail": "protocol mode skips web UI probe",
                     }
-                    # write g2a auth file
                     try:
                         rec = token_to_cpa_record(token_dict, email=email, sso=sso)
                         gdir = Path(str(self.cfg.get("g2a_auth_dir") or "g2a_auth"))
                         gdir.mkdir(parents=True, exist_ok=True)
                         safe = email.replace("@", "_")
                         path = gdir / f"xai-{safe}.json"
-                        import json as _json
-
                         path.write_text(
-                            _json.dumps(rec, ensure_ascii=False, indent=2) + "\n",
+                            json.dumps(rec, ensure_ascii=False, indent=2) + "\n",
                             encoding="utf-8",
                         )
                         out["g2a_auth_file"] = str(path)

@@ -1,7 +1,8 @@
 name: register-protocol
 
 # Protocol mode: HTTP signup + Build OAuth + probe (no browser UI).
-# Requires secrets: PROXY_URL, TEMPMAIL_BASE_URL, YESCAPTCHA_API_KEY
+# Captcha: local Camoufox turnstile-solver (default :5072), NOT YesCaptcha.
+# Requires secrets: PROXY_URL, TEMPMAIL_BASE_URL
 # Optional: SCHEDULER_* for frontend upload
 
 on:
@@ -19,9 +20,16 @@ on:
 jobs:
   protocol-register:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install system deps (Camoufox / display)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb ca-certificates fonts-liberation fonts-noto-cjk \
+            libgtk-3-0 libx11-xcb1 libasound2 || true
 
       - name: Setup uv / Python
         uses: astral-sh/setup-uv@v5
@@ -31,11 +39,33 @@ jobs:
       - name: Install project
         run: uv sync
 
+      - name: Install + start local Camoufox turnstile solver
+        run: |
+          cd turnstile-solver
+          python -m venv .venv
+          .venv/bin/pip install -U pip setuptools wheel
+          .venv/bin/pip install -r requirements.txt
+          .venv/bin/python -m camoufox fetch || true
+          mkdir -p logs
+          nohup .venv/bin/python api_solver.py \
+            --browser_type camoufox --thread 1 --host 127.0.0.1 --port 5072 \
+            > logs/solver.log 2>&1 &
+          echo $! > logs/solver.pid
+          # wait health
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:5072/health >/dev/null 2>&1; then
+              echo "local solver ready"
+              curl -sS http://127.0.0.1:5072/health || true
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "solver failed to start"; tail -50 logs/solver.log || true; exit 1
+
       - name: Write config
         env:
           PROXY_URL: ${{ secrets.PROXY_URL }}
           TEMPMAIL_BASE_URL: ${{ secrets.TEMPMAIL_BASE_URL }}
-          YESCAPTCHA_API_KEY: ${{ secrets.YESCAPTCHA_API_KEY }}
           TEMPMAIL_DOMAINS: ${{ inputs.domains }}
         run: |
           python <<'PY'
@@ -44,8 +74,9 @@ jobs:
           cfg["proxy"] = os.environ.get("PROXY_URL") or ""
           if os.environ.get("TEMPMAIL_BASE_URL"):
               cfg["tempmail_base_url"] = os.environ["TEMPMAIL_BASE_URL"]
-          cfg["yescaptcha_api_key"] = os.environ.get("YESCAPTCHA_API_KEY") or ""
           cfg["browser_engine"] = "protocol"
+          cfg["captcha_provider"] = "local"
+          cfg["local_solver_url"] = "http://127.0.0.1:5072"
           cfg["protocol_build_oauth"] = True
           cfg["register_count"] = int("${{ inputs.count }}" or "1")
           cfg["grok2api_auto_add_remote"] = False
@@ -59,17 +90,16 @@ jobs:
                       domains.append(d)
           cfg["tempmail_domains"] = domains or default_domains
           json.dump(cfg, open("config.json", "w", encoding="utf-8"), indent=2)
-          print("protocol config domains=%s yescaptcha=%s" % (
-              cfg["tempmail_domains"], bool(cfg["yescaptcha_api_key"])
-          ))
+          print("protocol config captcha=local domains=%s" % cfg["tempmail_domains"])
           PY
 
       - name: Run protocol register
         env:
           PROXY_URL: ${{ secrets.PROXY_URL }}
-          YESCAPTCHA_API_KEY: ${{ secrets.YESCAPTCHA_API_KEY }}
           TEMPMAIL_DOMAINS: ${{ inputs.domains }}
-        run: uv run python -m grokreg protocol-run --count ${{ inputs.count }}
+          LOCAL_SOLVER_URL: http://127.0.0.1:5072
+          YESCAPTCHA_ENDPOINT: http://127.0.0.1:5072
+        run: xvfb-run -a uv run python -m grokreg protocol-run --count ${{ inputs.count }}
 
       - name: Build importable + upload scheduler
         if: always()

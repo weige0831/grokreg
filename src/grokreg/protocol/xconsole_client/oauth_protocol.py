@@ -195,7 +195,27 @@ class ProtocolOAuthClient:
         self._yescaptcha_key = (yescaptcha_key or "").strip()
         self.solver: Optional[YesCaptchaSolver] = None
         if self._yescaptcha_key:
-            self.solver = YesCaptchaSolver(self._yescaptcha_key, debug=debug)
+            # "local" / Camoufox solver: YesCaptcha-compatible API on LOCAL_SOLVER_URL
+            import os as _os
+
+            local_ep = (
+                (_os.environ.get("LOCAL_SOLVER_URL") or "").strip()
+                or (_os.environ.get("YESCAPTCHA_ENDPOINT") or "").strip()
+                or (_os.environ.get("GROK2API_LOCAL_SOLVER_URL") or "").strip()
+            )
+            if self._yescaptcha_key.lower() in {"local", "camoufox", "solver"} or (
+                local_ep and ("127.0.0.1" in local_ep or "localhost" in local_ep)
+            ):
+                self.solver = YesCaptchaSolver(
+                    self._yescaptcha_key or "local",
+                    endpoint=local_ep or "http://127.0.0.1:5072",
+                    timeout=120,
+                    poll_interval=1.0,
+                    debug=debug,
+                    auto_fallback_endpoint=False,
+                )
+            else:
+                self.solver = YesCaptchaSolver(self._yescaptcha_key, debug=debug)
         try:
             from curl_cffi import requests as creq
         except ImportError as exc:
