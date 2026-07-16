@@ -131,7 +131,12 @@ class TurnstileAPIServer:
         self.use_random_config = use_random_config
         self.browser_name = browser_name
         self.browser_version = browser_version
-        self.console = Console()
+        # Avoid Windows legacy console / cp1252 crashes on emoji welcome banners.
+        self.console = Console(
+            force_terminal=False,
+            legacy_windows=False,
+            soft_wrap=True,
+        )
 
         # Lazy pool: do not keep Camoufox/Chromium warm while idle.
         # TURNSTILE_LAZY=1 (default) starts browsers on first solve request.
