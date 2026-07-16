@@ -8,7 +8,15 @@ from typing import Any
 DEFAULTS: dict[str, Any] = {
     "email_provider": "tempmail",
     "tempmail_base_url": "https://mail.minecraft-cn.net",
-    "tempmail_domains": ["mtoosov.shop", "olsbvgq.shop", "htazmbb.shop"],
+    "tempmail_domains": [
+        "mtoosov.shop",
+        "olsbvgq.shop",
+        "htazmbb.shop",
+        "cabuhu.cn",
+        "pfdszfg.shop",
+        "tnfolpr.shop",
+        "xiiktcx.cn",
+    ],
     "tempmail_poll_interval": 2,
     "tempmail_timeout": 120,
     "tempmail_list_limit": 30,

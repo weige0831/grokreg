@@ -43,7 +43,18 @@ class TempMailClient:
         log: LogFn | None = None,
     ) -> None:
         self.base = str(base_url or "").rstrip("/")
-        self.domains = list(domains or ["mtoosov.shop", "olsbvgq.shop", "htazmbb.shop"])
+        self.domains = list(
+            domains
+            or [
+                "mtoosov.shop",
+                "olsbvgq.shop",
+                "htazmbb.shop",
+                "cabuhu.cn",
+                "pfdszfg.shop",
+                "tnfolpr.shop",
+                "xiiktcx.cn",
+            ]
+        )
         self.proxy = (proxy or "").strip()
         self.poll_interval = max(0.5, float(poll_interval))
         self.timeout = max(10.0, float(timeout))

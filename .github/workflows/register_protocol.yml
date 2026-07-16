@@ -14,7 +14,7 @@ on:
       domains:
         description: "Tempmail domains (comma-separated)"
         required: false
-        default: "mtoosov.shop,olsbvgq.shop,htazmbb.shop"
+        default: "mtoosov.shop,olsbvgq.shop,htazmbb.shop,cabuhu.cn,pfdszfg.shop,tnfolpr.shop,xiiktcx.cn"
 
 jobs:
   protocol-register:
@@ -50,7 +50,7 @@ jobs:
           cfg["register_count"] = int("${{ inputs.count }}" or "1")
           cfg["grok2api_auto_add_remote"] = False
           raw = (os.environ.get("TEMPMAIL_DOMAINS") or "").strip()
-          default_domains = ["mtoosov.shop", "olsbvgq.shop", "htazmbb.shop"]
+          default_domains = ["mtoosov.shop", "olsbvgq.shop", "htazmbb.shop", "cabuhu.cn", "pfdszfg.shop", "tnfolpr.shop", "xiiktcx.cn"]
           domains = []
           if raw:
               for part in re.split(r"[,;\s]+", raw):

@@ -12,9 +12,9 @@ on:
         required: false
         default: "false"
       domains:
-        description: "Tempmail domains (comma-separated). Default: mtoosov.shop,olsbvgq.shop,htazmbb.shop"
+        description: "Tempmail domains (comma-separated). Default: mtoosov.shop,olsbvgq.shop,htazmbb.shop,cabuhu.cn,pfdszfg.shop,tnfolpr.shop,xiiktcx.cn"
         required: false
-        default: "mtoosov.shop,olsbvgq.shop,htazmbb.shop"
+        default: "mtoosov.shop,olsbvgq.shop,htazmbb.shop,cabuhu.cn,pfdszfg.shop,tnfolpr.shop,xiiktcx.cn"
 
 jobs:
   register:
@@ -62,7 +62,7 @@ jobs:
           cfg["browser_build_authorize"] = True
           cfg["require_web_before_build"] = True
           raw = (os.environ.get("TEMPMAIL_DOMAINS") or "").strip()
-          default_domains = ["mtoosov.shop", "olsbvgq.shop", "htazmbb.shop"]
+          default_domains = ["mtoosov.shop", "olsbvgq.shop", "htazmbb.shop", "cabuhu.cn", "pfdszfg.shop", "tnfolpr.shop", "xiiktcx.cn"]
           domains = []
           if raw:
               for part in re.split(r"[,;\s]+", raw):

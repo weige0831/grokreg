@@ -15,9 +15,9 @@ on:
         required: false
         default: "false"
       domains:
-        description: "Tempmail domains (comma-separated). Default: mtoosov.shop,olsbvgq.shop,htazmbb.shop"
+        description: "Tempmail domains (comma-separated). Default: mtoosov.shop,olsbvgq.shop,htazmbb.shop,cabuhu.cn,pfdszfg.shop,tnfolpr.shop,xiiktcx.cn"
         required: false
-        default: "mtoosov.shop,olsbvgq.shop,htazmbb.shop"
+        default: "mtoosov.shop,olsbvgq.shop,htazmbb.shop,cabuhu.cn,pfdszfg.shop,tnfolpr.shop,xiiktcx.cn"
 
 jobs:
   prepare:
@@ -59,7 +59,7 @@ jobs:
     uses: ./.github/workflows/register_windows.yml
     with:
       headless: ${{ inputs.headless || 'false' }}
-      domains: ${{ inputs.domains || 'mtoosov.shop,olsbvgq.shop,htazmbb.shop' }}
+      domains: ${{ inputs.domains || 'mtoosov.shop,olsbvgq.shop,htazmbb.shop,cabuhu.cn,pfdszfg.shop,tnfolpr.shop,xiiktcx.cn' }}
       slot: ${{ matrix.slot }}
     secrets: inherit
 
