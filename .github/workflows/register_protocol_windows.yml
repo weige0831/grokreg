@@ -85,9 +85,16 @@ jobs:
 
       - name: Start local Camoufox solver
         shell: bash
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+          PYTHONLEGACYWINDOWSSTDIO: "0"
         run: |
           cd turnstile-solver
-          nohup .venv/Scripts/python api_solver.py \
+          # Force UTF-8 so rich/emoji welcome does not crash on Windows cp1252
+          export PYTHONIOENCODING=utf-8
+          export PYTHONUTF8=1
+          nohup .venv/Scripts/python -X utf8 api_solver.py \
             --browser_type camoufox --thread 1 --host 127.0.0.1 --port 5072 \
             > logs/solver.log 2>&1 &
           echo $! > logs/solver.pid
@@ -97,10 +104,19 @@ jobs:
               curl -sS http://127.0.0.1:5072/health || true
               exit 0
             fi
+            # if process died early, dump log and fail fast
+            if ! kill -0 "$(cat logs/solver.pid 2>/dev/null)" 2>/dev/null; then
+              # Windows: bash kill -0 may not work on python pid; check log for crash
+              if grep -qE "Error|Traceback|LifespanFailure" logs/solver.log 2>/dev/null; then
+                echo "solver process crashed"
+                tail -100 logs/solver.log || true
+                exit 1
+              fi
+            fi
             sleep 2
           done
           echo "solver failed to start"
-          tail -80 logs/solver.log || true
+          tail -100 logs/solver.log || true
           exit 1
 
       - name: Write config (protocol Windows)

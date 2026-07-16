@@ -205,11 +205,15 @@ class TurnstileAPIServer:
             width=50
         )
 
-        self.console.print(info_panel)
-        self.console.print()
-
-
-
+        try:
+            self.console.print(info_panel)
+            self.console.print()
+        except (UnicodeEncodeError, OSError):
+            # Windows GHA / cp1252 consoles choke on emoji — never block startup.
+            try:
+                print("Turnstile Solver ready", flush=True)
+            except Exception:
+                pass
 
     def _setup_routes(self) -> None:
         """Set up the application routes."""
@@ -227,7 +231,10 @@ class TurnstileAPIServer:
 
     async def _startup(self) -> None:
         """Boot HTTP + DB; optionally warm browsers (or wait for first task)."""
-        self.display_welcome()
+        try:
+            self.display_welcome()
+        except Exception as exc:
+            logger.warning("display_welcome skipped: %s", exc)
         self._pool_lock = asyncio.Lock()
         try:
             await init_db()
