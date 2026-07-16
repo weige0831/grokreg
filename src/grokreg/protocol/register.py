@@ -16,8 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from grokreg.mail.tempmail import TempMailClient, TempMailError
-from grokreg.mint.auth_code import token_to_cpa_record
-from grokreg.probe.build45 import probe_chat_completions, probe_responses
+from grokreg.mint.auth_code import (
+    activate_account_for_build,
+    decode_jwt_payload,
+    token_to_cpa_record,
+)
+from grokreg.probe.build45 import probe_with_settle_retry
 from grokreg.protocol.local_solver import (
     local_solver_url,
     pin_local_solver_env,
@@ -228,55 +232,107 @@ class ProtocolRegistrar:
                 if bool(self.cfg.get("protocol_build_oauth", True)):
                     session_cookies = extract_cookies_from_auth_client(client) or {}
                     session_cookies.setdefault("sso", sso)
-                    self.log("[proto] Build OAuth (protocol)…")
-                    # ensure oauth path also uses local solver endpoint via env
-                    if captcha_mode == "local":
-                        pin_local_solver_env(local_solver_url(self.cfg))
-                    oauth = login_with_protocol(
-                        email,
-                        password,
-                        yescaptcha_key=ykey_for_oauth or "local",
-                        proxy=proxy,
-                        debug=debug,
-                        session_cookies=session_cookies,
-                        auth_client=client,
-                        cliproxyapi_disabled=True,
-                    )
-                    access = str(getattr(oauth, "access_token", "") or "")
-                    refresh = str(getattr(oauth, "refresh_token", "") or "")
-                    id_token = str(getattr(oauth, "id_token", "") or "")
+                    token_dict: dict[str, Any] = {}
+                    oauth_err = ""
+                    # 1) pure protocol OAuth (consent next-action scraped live)
+                    try:
+                        self.log("[proto] Build OAuth (protocol)…")
+                        if captcha_mode == "local":
+                            pin_local_solver_env(local_solver_url(self.cfg))
+                        oauth = login_with_protocol(
+                            email,
+                            password,
+                            yescaptcha_key=ykey_for_oauth or "local",
+                            proxy=proxy,
+                            debug=debug,
+                            session_cookies=session_cookies,
+                            auth_client=client,
+                            cliproxyapi_disabled=True,
+                        )
+                        access = str(getattr(oauth, "access_token", "") or "")
+                        refresh = str(getattr(oauth, "refresh_token", "") or "")
+                        id_token = str(getattr(oauth, "id_token", "") or "")
+                        if access:
+                            token_dict = {
+                                "access_token": access,
+                                "refresh_token": refresh,
+                                "id_token": id_token,
+                                "token_type": "Bearer",
+                                "expires_in": getattr(oauth, "expires_in", None),
+                            }
+                            out["build_web"] = {
+                                "ok": True,
+                                "code": "build_protocol_ok",
+                                "token": token_dict,
+                                "method": "protocol_oauth",
+                            }
+                        else:
+                            oauth_err = "empty access_token"
+                    except Exception as exc:
+                        oauth_err = str(exc)[:300]
+                        self.log(f"[proto] protocol OAuth failed: {oauth_err}")
+
+                    # 2) fallback: existing HTTP mint (SSO cookie → authorize code → token)
+                    if not token_dict.get("access_token"):
+                        self.log("[proto] fallback Build mint via sso_to_token…")
+                        try:
+                            from grokreg.mint.auth_code import sso_to_token
+
+                            tok = sso_to_token(sso, proxy=proxy, log=self.log)
+                            token_dict = {
+                                "access_token": str(tok.get("access_token") or ""),
+                                "refresh_token": str(tok.get("refresh_token") or ""),
+                                "id_token": str(tok.get("id_token") or ""),
+                                "token_type": str(tok.get("token_type") or "Bearer"),
+                                "expires_in": tok.get("expires_in"),
+                            }
+                            if not token_dict["access_token"]:
+                                raise ProtocolRegisterError("sso_to_token empty access")
+                            out["build_web"] = {
+                                "ok": True,
+                                "code": "build_mint_ok",
+                                "token": token_dict,
+                                "method": "sso_mint_fallback",
+                                "oauth_error": oauth_err,
+                            }
+                        except Exception as exc:
+                            raise ProtocolRegisterError(
+                                f"Build authorize failed (protocol: {oauth_err}; mint: {exc})"
+                            ) from exc
+
+                    access = str(token_dict.get("access_token") or "")
                     if not access:
                         raise ProtocolRegisterError("Build OAuth returned empty access_token")
-                    token_dict = {
-                        "access_token": access,
-                        "refresh_token": refresh,
-                        "id_token": id_token,
-                        "token_type": "Bearer",
-                        "expires_in": getattr(oauth, "expires_in", None),
-                    }
-                    out["build_web"] = {
-                        "ok": True,
-                        "code": "build_protocol_ok",
-                        "token": token_dict,
-                        "method": "protocol_oauth",
-                    }
-                    pr = probe_responses(
+
+                    # TOS/birth before probe (same as browser/HTTP mint path)
+                    if bool(self.cfg.get("activate_before_probe", True)):
+                        self.log("[proto] activate TOS/birth…")
+                        act = activate_account_for_build(sso, proxy=proxy, log=self.log)
+                        out["activate"] = act
+
+                    claims = decode_jwt_payload(access)
+                    bot_flag = claims.get("bot_flag_source")
+                    if isinstance(out.get("build_web"), dict):
+                        out["build_web"]["bot_flag"] = bot_flag
+                        out["build_web"]["referrer"] = claims.get("referrer")
+
+                    self.log(
+                        f"[proto] probe Build (settle-retry) bot_flag={bot_flag!r} "
+                        f"referrer={claims.get('referrer')!r}"
+                    )
+                    pr = probe_with_settle_retry(
                         access,
                         base_url=str(self.cfg.get("probe_base_url") or "https://cli-chat-proxy.grok.com/v1"),
                         model=str(self.cfg.get("probe_model") or "grok-4.5"),
                         proxy=proxy,
                         timeout=float(self.cfg.get("probe_timeout") or 60),
+                        fail_status_codes=list(self.cfg.get("probe_fail_status_codes") or []),
+                        endpoint=str(self.cfg.get("probe_endpoint") or "responses"),
+                        retries=int(self.cfg.get("probe_settle_retries") or 3),
+                        retry_delay_sec=float(self.cfg.get("probe_settle_delay_sec") or 8),
+                        log=self.log,
                     )
-                    if not pr.get("ok") and int(pr.get("status") or 0) == 403:
-                        pr2 = probe_chat_completions(
-                            access,
-                            base_url=str(self.cfg.get("probe_base_url") or "https://cli-chat-proxy.grok.com/v1"),
-                            model=str(self.cfg.get("probe_model") or "grok-4.5"),
-                            proxy=proxy,
-                            timeout=float(self.cfg.get("probe_timeout") or 60),
-                        )
-                        if pr2.get("ok"):
-                            pr = pr2
+                    pr["bot_flag"] = bot_flag
                     out["probe"] = pr
                     out["web"] = {
                         "ok": True,

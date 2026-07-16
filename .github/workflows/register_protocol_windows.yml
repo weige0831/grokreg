@@ -1,0 +1,477 @@
+name: register-protocol-windows
+
+# Windows protocol register + Build OAuth + probe (N accounts per job).
+# Captcha: local Camoufox turnstile-solver (:5072), not YesCaptcha.
+# Callable as child (workflow_call) or standalone (workflow_dispatch).
+# Does NOT upload to grok2api. Uploads probe_ok accounts to scheduler frontend.
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "Accounts to register in this job (default 2)"
+        required: false
+        default: "2"
+      domains:
+        description: "Tempmail domains (comma-separated). Default: mtoosov.shop,olsbvgq.shop,htazmbb.shop,cabuhu.cn,pfdszfg.shop,tnfolpr.shop,xiiktcx.cn"
+        required: false
+        default: "mtoosov.shop,olsbvgq.shop,htazmbb.shop,cabuhu.cn,pfdszfg.shop,tnfolpr.shop,xiiktcx.cn"
+      slot:
+        description: "batch slot id (for artifact naming)"
+        required: false
+        default: "1"
+  workflow_call:
+    inputs:
+      count:
+        description: "Accounts to register in this job"
+        type: string
+        required: false
+        default: "2"
+      domains:
+        description: "Tempmail domains (comma-separated)"
+        type: string
+        required: false
+        default: "mtoosov.shop,olsbvgq.shop,htazmbb.shop,cabuhu.cn,pfdszfg.shop,tnfolpr.shop,xiiktcx.cn"
+      slot:
+        description: "batch slot id"
+        type: string
+        required: false
+        default: "1"
+    outputs:
+      probe_ok:
+        description: "1 if probe ok else 0"
+        value: ${{ jobs.register-protocol-windows.outputs.probe_ok }}
+      uploaded:
+        description: "accounts uploaded to scheduler"
+        value: ${{ jobs.register-protocol-windows.outputs.uploaded }}
+      email:
+        description: "registered email if any"
+        value: ${{ jobs.register-protocol-windows.outputs.email }}
+      status:
+        description: "pipeline status"
+        value: ${{ jobs.register-protocol-windows.outputs.status }}
+
+jobs:
+  register-protocol-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    outputs:
+      probe_ok: ${{ steps.metrics.outputs.probe_ok }}
+      uploaded: ${{ steps.metrics.outputs.uploaded }}
+      email: ${{ steps.metrics.outputs.email }}
+      status: ${{ steps.metrics.outputs.status }}
+      reg_fail: ${{ steps.metrics.outputs.reg_fail }}
+      probe_fail: ${{ steps.metrics.outputs.probe_fail }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup uv / Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project
+        run: uv sync
+
+      - name: Install local Camoufox turnstile solver
+        shell: bash
+        run: |
+          cd turnstile-solver
+          python -m venv .venv
+          .venv/Scripts/python -m pip install -U pip setuptools wheel
+          .venv/Scripts/python -m pip install -r requirements.txt
+          .venv/Scripts/python -m camoufox fetch || true
+          mkdir -p logs
+
+      - name: Start local Camoufox solver
+        shell: bash
+        run: |
+          cd turnstile-solver
+          nohup .venv/Scripts/python api_solver.py \
+            --browser_type camoufox --thread 1 --host 127.0.0.1 --port 5072 \
+            > logs/solver.log 2>&1 &
+          echo $! > logs/solver.pid
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:5072/health >/dev/null 2>&1; then
+              echo "local solver ready"
+              curl -sS http://127.0.0.1:5072/health || true
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "solver failed to start"
+          tail -80 logs/solver.log || true
+          exit 1
+
+      - name: Write config (protocol Windows)
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          TEMPMAIL_BASE_URL: ${{ secrets.TEMPMAIL_BASE_URL }}
+          TEMPMAIL_DOMAINS: ${{ inputs.domains }}
+          JOB_COUNT: ${{ inputs.count }}
+        shell: bash
+        run: |
+          python <<'PY'
+          import json, os, re
+          cfg = json.load(open("config.example.json", encoding="utf-8"))
+          cfg["proxy"] = os.environ.get("PROXY_URL") or ""
+          if os.environ.get("TEMPMAIL_BASE_URL"):
+              cfg["tempmail_base_url"] = os.environ["TEMPMAIL_BASE_URL"]
+          cfg["browser_engine"] = "protocol"
+          cfg["captcha_provider"] = "local"
+          cfg["local_solver_url"] = "http://127.0.0.1:5072"
+          cfg["protocol_build_oauth"] = True
+          cfg["activate_before_probe"] = True
+          try:
+              n = int((os.environ.get("JOB_COUNT") or "2").strip())
+          except Exception:
+              n = 2
+          cfg["register_count"] = max(1, n)
+          cfg["grok2api_auto_add_remote"] = False
+          cfg["grok2api_remote_base"] = ""
+          cfg["grok2api_remote_app_key"] = ""
+          raw = (os.environ.get("TEMPMAIL_DOMAINS") or "").strip()
+          default_domains = [
+              "mtoosov.shop", "olsbvgq.shop", "htazmbb.shop", "cabuhu.cn",
+              "pfdszfg.shop", "tnfolpr.shop", "xiiktcx.cn",
+          ]
+          domains = []
+          if raw:
+              for part in re.split(r"[,;\s]+", raw):
+                  d = part.strip().lower().lstrip("@")
+                  if d and d not in domains:
+                      domains.append(d)
+          cfg["tempmail_domains"] = domains or default_domains
+          json.dump(cfg, open("config.json", "w", encoding="utf-8"), indent=2)
+          print(
+              "protocol-windows config count=%s captcha=local proxy=%s domains=%s"
+              % (cfg["register_count"], bool(cfg["proxy"]), cfg["tempmail_domains"])
+          )
+          PY
+
+      - name: Run protocol register + probe
+        id: run
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          TEMPMAIL_DOMAINS: ${{ inputs.domains }}
+          JOB_COUNT: ${{ inputs.count }}
+          LOCAL_SOLVER_URL: http://127.0.0.1:5072
+          YESCAPTCHA_ENDPOINT: http://127.0.0.1:5072
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        shell: bash
+        run: |
+          n="${JOB_COUNT:-2}"
+          case "$n" in
+            ''|*[!0-9]*) n=2 ;;
+          esac
+          if [ "$n" -lt 1 ]; then n=1; fi
+          uv run python -m grokreg protocol-run --count "$n"
+
+      - name: Build importable for scheduler
+        if: always()
+        shell: bash
+        run: |
+          python <<'PY'
+          import json, pathlib
+          side = pathlib.Path("importable.jsonl")
+          lines_out = []
+          if side.exists():
+              for line in side.read_text(encoding="utf-8").splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      it = json.loads(line)
+                  except Exception:
+                      continue
+                  it.setdefault("source", "gha-protocol-windows")
+                  tags = list(it.get("tags") or [])
+                  for t in ("protocol", "no-upload", "gha", "windows"):
+                      if t not in tags:
+                          tags.append(t)
+                  it["tags"] = tags
+                  lines_out.append(it)
+          pathlib.Path("importable.json").write_text(
+              json.dumps(lines_out, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          print(f"importable accounts: {len(lines_out)}")
+          for it in lines_out:
+              print(f"  - {it.get('email')} access={'yes' if it.get('access_token') else 'no'}")
+          PY
+
+      - name: Upload success account to scheduler frontend
+        id: upload
+        if: always()
+        continue-on-error: true
+        env:
+          SCHEDULER_URL: ${{ secrets.SCHEDULER_URL }}
+          SCHEDULER_USER: ${{ secrets.SCHEDULER_USER }}
+          SCHEDULER_PASS: ${{ secrets.SCHEDULER_PASS }}
+          SCHEDULER_TOKEN: ${{ secrets.SCHEDULER_TOKEN }}
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        shell: bash
+        run: |
+          python <<'PY'
+          import json, os, pathlib, sys, urllib.error, urllib.request
+
+          result = {
+              "uploaded": 0,
+              "created": 0,
+              "updated": 0,
+              "skipped": 0,
+              "ok": False,
+              "error": "",
+          }
+
+          def save():
+              pathlib.Path("upload_result.json").write_text(
+                  json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+              )
+              print(json.dumps(result, ensure_ascii=False))
+
+          base = (os.environ.get("SCHEDULER_URL") or "").rstrip("/")
+          if not base:
+              result["error"] = "SCHEDULER_URL not set"
+              save()
+              sys.exit(0)
+
+          imp = pathlib.Path("importable.json")
+          if not imp.exists():
+              result["error"] = "no importable.json"
+              save()
+              sys.exit(0)
+          accounts = json.loads(imp.read_text(encoding="utf-8"))
+          if not accounts:
+              result["error"] = "importable empty"
+              save()
+              sys.exit(0)
+
+          def req(method, url, data=None, token=""):
+              body = None if data is None else json.dumps(data).encode("utf-8")
+              headers = {"Content-Type": "application/json", "Accept": "application/json"}
+              if token:
+                  headers["Authorization"] = f"Bearer {token}"
+              r = urllib.request.Request(url, data=body, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(r, timeout=60) as resp:
+                      raw = resp.read().decode("utf-8", errors="replace")
+                      return resp.status, json.loads(raw) if raw else {}
+              except urllib.error.HTTPError as e:
+                  raw = e.read().decode("utf-8", errors="replace")
+                  try:
+                      j = json.loads(raw) if raw else {}
+                  except Exception:
+                      j = {"raw": raw[:300]}
+                  return e.code, j
+
+          token = (os.environ.get("SCHEDULER_TOKEN") or "").strip()
+          if not token:
+              user = os.environ.get("SCHEDULER_USER") or "admin"
+              pwd = os.environ.get("SCHEDULER_PASS") or ""
+              if not pwd:
+                  result["error"] = "need SCHEDULER_TOKEN or USER/PASS"
+                  save()
+                  sys.exit(1)
+              code, login = req("POST", f"{base}/api/auth/login", {"username": user, "password": pwd})
+              if code != 200 or not login.get("token"):
+                  result["error"] = f"login failed {code}"
+                  save()
+                  sys.exit(1)
+              token = login["token"]
+              print("scheduler login ok")
+
+          payload = {"accounts": []}
+          for a in accounts:
+              payload["accounts"].append({
+                  "email": a.get("email") or "",
+                  "password": a.get("password") or "",
+                  "sso": a.get("sso") or "",
+                  "access_token": a.get("access_token") or "",
+                  "refresh_token": a.get("refresh_token") or "",
+                  "id_token": a.get("id_token") or "",
+                  "probe_status": int(a.get("probe_status") or 200),
+                  "probe_detail": a.get("probe_detail") or "probe_ok",
+                  "tags": a.get("tags") or ["protocol", "probe-ok", "gha", "windows"],
+                  "source": a.get("source") or "gha-protocol-windows",
+              })
+          code, res = req("POST", f"{base}/api/accounts/import", payload, token=token)
+          print(f"import status={code} result={res}")
+          if code != 200:
+              result["error"] = f"import HTTP {code}: {res}"
+              save()
+              sys.exit(1)
+          result["ok"] = True
+          result["created"] = int(res.get("created") or 0)
+          result["updated"] = int(res.get("updated") or 0)
+          result["skipped"] = int(res.get("skipped") or 0)
+          result["uploaded"] = int(res.get("total") or (result["created"] + result["updated"]))
+          save()
+          print("uploaded to scheduler frontend OK")
+          PY
+
+      - name: Write metrics
+        id: metrics
+        if: always()
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+          SLOT: ${{ inputs.slot }}
+          RUN_OK: ${{ steps.run.outcome }}
+        shell: bash
+        run: |
+          python <<'PY'
+          import json, os, pathlib, sys
+          try:
+              sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+          except Exception:
+              pass
+
+          lines = []
+          p = pathlib.Path("results.jsonl")
+          if p.exists():
+              for line in p.read_text(encoding="utf-8").splitlines():
+                  try:
+                      lines.append(json.loads(line))
+                  except Exception:
+                      pass
+
+          probe_ok = sum(
+              1 for r in lines if r.get("status") in ("probe_ok", "upload_ok", "upload_fail") or r.get("usable") is True
+          )
+          reg_fail = sum(1 for r in lines if r.get("status") == "reg_fail")
+          probe_fail = sum(
+              1
+              for r in lines
+              if r.get("status") in ("probe_fail", "build_fail") or r.get("usable") is False
+          )
+          emails = [str(r.get("email") or "") for r in lines if r.get("email")]
+          email = ",".join(emails[:5])
+          if len(emails) > 5:
+              email += f",+{len(emails)-5}"
+          statuses = [str(r.get("status") or "") for r in lines]
+          status = ",".join(statuses[:5]) if statuses else ""
+
+          uploaded = 0
+          upload_ok = False
+          up = pathlib.Path("upload_result.json")
+          if up.exists():
+              try:
+                  u = json.loads(up.read_text(encoding="utf-8"))
+                  uploaded = int(u.get("uploaded") or 0)
+                  upload_ok = bool(u.get("ok"))
+              except Exception:
+                  pass
+
+          n_imp = 0
+          imp = pathlib.Path("importable.json")
+          if imp.exists():
+              try:
+                  n_imp = len(json.loads(imp.read_text(encoding="utf-8")))
+              except Exception:
+                  n_imp = 0
+
+          metrics = {
+              "slot": os.environ.get("SLOT") or "1",
+              "engine": "protocol",
+              "run_outcome": os.environ.get("RUN_OK") or "",
+              "total": len(lines),
+              "probe_ok": probe_ok,
+              "probe_fail": probe_fail,
+              "reg_fail": reg_fail,
+              "importable": n_imp,
+              "uploaded": uploaded,
+              "upload_ok": upload_ok,
+              "email": email,
+              "status": status,
+          }
+          pathlib.Path("metrics.json").write_text(
+              json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+          )
+          gh = os.environ.get("GITHUB_OUTPUT")
+          if gh:
+              with open(gh, "a", encoding="utf-8") as f:
+                  f.write(f"probe_ok={probe_ok}\n")
+                  f.write(f"uploaded={uploaded}\n")
+                  f.write(f"email={email}\n")
+                  f.write(f"status={status}\n")
+                  f.write(f"reg_fail={reg_fail}\n")
+                  f.write(f"probe_fail={probe_fail}\n")
+          print(json.dumps(metrics, ensure_ascii=False))
+          PY
+
+      - name: Job summary
+        if: always()
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        shell: bash
+        run: |
+          python <<'PY'
+          import json, os, pathlib, sys
+          try:
+              sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+          except Exception:
+              pass
+          m = {}
+          if pathlib.Path("metrics.json").exists():
+              m = json.loads(pathlib.Path("metrics.json").read_text(encoding="utf-8"))
+          md = (
+              "## register-protocol-windows (slot {slot})\n"
+              "- engine: protocol + Camoufox local solver\n"
+              "- email: {email}\n"
+              "- status: {status}\n"
+              "- probe_ok: {probe_ok}\n"
+              "- probe_fail: {probe_fail}\n"
+              "- reg_fail: {reg_fail}\n"
+              "- importable: {importable}\n"
+              "- uploaded_to_scheduler: {uploaded} (ok={upload_ok})\n"
+              "- runner: windows-latest\n"
+          ).format(
+              slot=m.get("slot", "?"),
+              email=m.get("email") or "?",
+              status=m.get("status") or "?",
+              probe_ok=m.get("probe_ok", 0),
+              probe_fail=m.get("probe_fail", 0),
+              reg_fail=m.get("reg_fail", 0),
+              importable=m.get("importable", 0),
+              uploaded=m.get("uploaded", 0),
+              upload_ok=m.get("upload_ok", False),
+          )
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              pathlib.Path(summary).write_text(md, encoding="utf-8")
+          print(md.encode("ascii", errors="replace").decode("ascii"))
+          PY
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: register-protocol-windows-${{ github.run_id }}-slot-${{ inputs.slot || '1' }}
+          path: |
+            results.jsonl
+            accounts.txt
+            importable.json
+            importable.jsonl
+            upload_result.json
+            metrics.json
+            g2a_auth/
+            diag/
+            turnstile-solver/logs/
+          if-no-files-found: warn
+
+      - name: Fail job if register not usable
+        if: always()
+        shell: bash
+        run: |
+          python <<'PY'
+          import json, pathlib, sys
+          m = {}
+          if pathlib.Path("metrics.json").exists():
+              m = json.loads(pathlib.Path("metrics.json").read_text(encoding="utf-8"))
+          # job succeeds if at least one account probe_ok
+          ok = int(m.get("probe_ok") or 0) > 0
+          sys.exit(0 if ok else 1)
+          PY

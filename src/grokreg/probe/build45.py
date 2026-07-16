@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from curl_cffi import requests
@@ -17,6 +18,84 @@ from grokreg.util.log import LogFn, default_log
 DEFAULT_BASE = CPA_GROK_BASE_URL
 DEFAULT_MODEL = "grok-4.5"
 FAIL_STATUSES = {400, 401, 402, 403, 429, 439, 500, 502, 503}
+
+
+def is_transient_probe_denial(result: dict[str, Any]) -> bool:
+    """True when brand-new OIDC tokens still settle (edi/grokv2 register_lite_store)."""
+    code = int(result.get("status") or result.get("status_code") or 0)
+    err = str(result.get("error") or "").lower()
+    if code == 403 and (
+        "permission-denied" in err
+        or "access to the chat endpoint is denied" in err
+        or "permissiondenied" in err
+    ):
+        return True
+    if code == 401 and "no auth context" in err:
+        return True
+    return False
+
+
+def probe_with_settle_retry(
+    access_token: str,
+    *,
+    base_url: str = DEFAULT_BASE,
+    model: str = DEFAULT_MODEL,
+    proxy: str = "",
+    timeout: float = 60.0,
+    fail_status_codes: list[int] | None = None,
+    endpoint: str = "responses",
+    retries: int = 3,
+    retry_delay_sec: float = 8.0,
+    log: LogFn | None = None,
+) -> dict[str, Any]:
+    """Probe Build API; retry transient permission-denied while token settles."""
+    log = log or default_log
+    attempts = max(1, int(retries or 1))
+    delay = max(0.0, float(retry_delay_sec or 0.0))
+    pr: dict[str, Any] = {"ok": False, "code": "probe_fail"}
+    for attempt in range(1, attempts + 1):
+        if endpoint == "chat/completions":
+            pr = probe_chat_completions(
+                access_token,
+                base_url=base_url,
+                model=model,
+                proxy=proxy,
+                timeout=timeout,
+                fail_status_codes=fail_status_codes,
+            )
+        else:
+            pr = probe_responses(
+                access_token,
+                base_url=base_url,
+                model=model,
+                proxy=proxy,
+                timeout=timeout,
+                fail_status_codes=fail_status_codes,
+            )
+            if not pr.get("ok") and int(pr.get("status") or 0) == 403:
+                pr2 = probe_chat_completions(
+                    access_token,
+                    base_url=base_url,
+                    model=model,
+                    proxy=proxy,
+                    timeout=timeout,
+                    fail_status_codes=fail_status_codes,
+                )
+                if pr2.get("ok"):
+                    pr = pr2
+        pr["attempt"] = attempt
+        if pr.get("ok"):
+            return pr
+        if attempt < attempts and is_transient_probe_denial(pr):
+            wait = delay * attempt
+            log(
+                f"[probe] transient denial attempt {attempt}/{attempts}, "
+                f"wait {wait:.0f}s then retry"
+            )
+            time.sleep(wait)
+            continue
+        break
+    return pr
 
 
 def _extract_text(body: dict[str, Any] | None, raw: str) -> str:
@@ -266,37 +345,19 @@ def mint_and_probe(
     result["bot_flag"] = claims.get("bot_flag_source")
     result["referrer"] = claims.get("referrer")
 
-    # sample primary: /v1/responses; fallback chat/completions
-    if endpoint == "chat/completions":
-        pr = probe_chat_completions(
-            token["access_token"],
-            base_url=base_url,
-            model=model,
-            proxy=proxy,
-            timeout=timeout,
-            fail_status_codes=fail_status_codes,
-        )
-    else:
-        pr = probe_responses(
-            token["access_token"],
-            base_url=base_url,
-            model=model,
-            proxy=proxy,
-            timeout=timeout,
-            fail_status_codes=fail_status_codes,
-        )
-        if not pr.get("ok") and pr.get("status") == 403:
-            log("[probe] /responses 403, try chat/completions")
-            pr2 = probe_chat_completions(
-                token["access_token"],
-                base_url=base_url,
-                model=model,
-                proxy=proxy,
-                timeout=timeout,
-                fail_status_codes=fail_status_codes,
-            )
-            if pr2.get("ok"):
-                pr = pr2
+    # sample primary: /v1/responses; fallback chat/completions + settle retry
+    pr = probe_with_settle_retry(
+        token["access_token"],
+        base_url=base_url,
+        model=model,
+        proxy=proxy,
+        timeout=timeout,
+        fail_status_codes=fail_status_codes,
+        endpoint=endpoint,
+        retries=3,
+        retry_delay_sec=8.0,
+        log=log,
+    )
 
     result.update(pr)
 

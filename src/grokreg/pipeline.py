@@ -274,7 +274,7 @@ def process_sso(
             row["error"] = str(exc)[:500]
         return row
 
-    # browser token path: probe Build API with obtained access_token
+    # browser/protocol token path: activate → probe Build API (settle retry)
     if access:
         row["access_token"] = access
         row["refresh_token"] = refresh
@@ -282,38 +282,35 @@ def process_sso(
             row["_token_full"] = full_token
             if full_token.get("id_token"):
                 row["id_token"] = str(full_token.get("id_token") or "")
-        from grokreg.probe.build45 import probe_responses, probe_chat_completions
+        from grokreg.mint.auth_code import activate_account_for_build, decode_jwt_payload
+        from grokreg.probe.build45 import probe_with_settle_retry
 
-        endpoint = str(cfg.get("probe_endpoint") or "responses")
-        if endpoint == "chat/completions":
-            pr = probe_chat_completions(
-                access,
-                base_url=str(cfg.get("probe_base_url") or "https://cli-chat-proxy.grok.com/v1"),
-                model=str(cfg.get("probe_model") or "grok-4.5"),
+        if bool(cfg.get("activate_before_probe", True)) and sso:
+            log("[pipe] activate TOS/birth before probe…")
+            act = activate_account_for_build(
+                sso,
                 proxy=proxy,
-                timeout=float(cfg.get("probe_timeout") or 60),
-                fail_status_codes=list(cfg.get("probe_fail_status_codes") or []),
+                cf_clearance=cf_clearance,
+                user_agent=user_agent,
+                log=log,
             )
-        else:
-            pr = probe_responses(
-                access,
-                base_url=str(cfg.get("probe_base_url") or "https://cli-chat-proxy.grok.com/v1"),
-                model=str(cfg.get("probe_model") or "grok-4.5"),
-                proxy=proxy,
-                timeout=float(cfg.get("probe_timeout") or 60),
-                fail_status_codes=list(cfg.get("probe_fail_status_codes") or []),
-            )
-            if not pr.get("ok") and int(pr.get("status") or 0) == 403:
-                pr2 = probe_chat_completions(
-                    access,
-                    base_url=str(cfg.get("probe_base_url") or "https://cli-chat-proxy.grok.com/v1"),
-                    model=str(cfg.get("probe_model") or "grok-4.5"),
-                    proxy=proxy,
-                    timeout=float(cfg.get("probe_timeout") or 60),
-                    fail_status_codes=list(cfg.get("probe_fail_status_codes") or []),
-                )
-                if pr2.get("ok"):
-                    pr = pr2
+            row["activate"] = act
+
+        claims = decode_jwt_payload(access)
+        pr = probe_with_settle_retry(
+            access,
+            base_url=str(cfg.get("probe_base_url") or "https://cli-chat-proxy.grok.com/v1"),
+            model=str(cfg.get("probe_model") or "grok-4.5"),
+            proxy=proxy,
+            timeout=float(cfg.get("probe_timeout") or 60),
+            fail_status_codes=list(cfg.get("probe_fail_status_codes") or []),
+            endpoint=str(cfg.get("probe_endpoint") or "responses"),
+            retries=int(cfg.get("probe_settle_retries") or 3),
+            retry_delay_sec=float(cfg.get("probe_settle_delay_sec") or 8),
+            log=log,
+        )
+        pr["bot_flag"] = claims.get("bot_flag_source")
+        pr["referrer"] = claims.get("referrer")
         row["probe"] = pr
         if not pr.get("ok"):
             status_code = int(pr.get("status") or 0)
@@ -324,7 +321,10 @@ def process_sso(
             if status_code == 403 or "403" in code or "permission" in code:
                 row["usable"] = False
                 row["code"] = "probe_403_unusable"
-                log("[pipe] Build probe 403 -> mark unusable")
+                log(
+                    f"[pipe] Build probe 403 -> mark unusable "
+                    f"bot_flag={pr.get('bot_flag')!r} attempts={pr.get('attempt')}"
+                )
             else:
                 row["usable"] = False
             return row

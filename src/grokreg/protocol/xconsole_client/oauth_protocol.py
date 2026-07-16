@@ -652,17 +652,92 @@ class ProtocolOAuthClient:
                 return success
             return str(resp.url)
 
+        def _scrape_consent_action_id(page_html: str) -> str:
+            """Dynamically scrape submitOAuth2Consent next-action from consent page + JS chunks.
+
+            Hard-coded action IDs break whenever accounts.x.ai redeploys (HTTP 404
+            'Server action not found'). Prefer live scrape like signup does.
+            """
+            html = page_html or ""
+            # 1) inline HTML / RSC
+            for pat in (
+                r'createServerReference\)\("([a-f0-9]{40,44})"[^)]*submitOAuth2Consent',
+                r'submitOAuth2Consent[^a-f0-9]{0,80}([a-f0-9]{40,44})',
+                r'["\']([a-f0-9]{40,44})["\'][^a-f0-9]{0,40}submitOAuth2Consent',
+            ):
+                m = re.search(pat, html)
+                if m:
+                    self._log(f"consent action from html: {m.group(1)[:16]}...")
+                    return m.group(1)
+
+            # 2) download JS chunks referenced by the page
+            js_paths = list(set(re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', html)))
+            self._log(f"scraping consent action from {len(js_paths)} JS chunks...")
+            named: list[str] = []
+            any_hex: list[str] = []
+
+            def _fetch(path: str) -> tuple[str, str]:
+                url = urljoin(ACCOUNTS_ORIGIN + "/", path.lstrip("/"))
+                try:
+                    rr = self._s.get(url, timeout=30)
+                    return path, rr.text or ""
+                except Exception:
+                    return path, ""
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                futs = [ex.submit(_fetch, p) for p in js_paths]
+                for fut in as_completed(futs):
+                    path, body = fut.result()
+                    if not body:
+                        continue
+                    # Prefer chunks that mention consent action by name
+                    if "submitOAuth2Consent" in body or "OAuth2Consent" in body or "oauth2/consent" in body:
+                        for m in re.finditer(
+                            r'createServerReference\)\("([a-f0-9]{40,44})"[^)]*submitOAuth2Consent',
+                            body,
+                        ):
+                            named.append(m.group(1))
+                        # window around keyword
+                        for key in ("submitOAuth2Consent", "OAuth2Consent", "consent"):
+                            idx = body.find(key)
+                            if idx < 0:
+                                continue
+                            window = body[max(0, idx - 800) : idx + 800]
+                            for m in re.finditer(r'createServerReference\)\("([a-f0-9]{40,44})"', window):
+                                named.append(m.group(1))
+                            for m in re.finditer(r'["\']([a-f0-9]{40,44})["\']', window):
+                                named.append(m.group(1))
+                    # also collect any createServerReference ids as weak fallback
+                    for m in re.finditer(r'createServerReference\)\("([a-f0-9]{40,44})"', body):
+                        any_hex.append(m.group(1))
+
+            # de-dupe preserve order
+            def _uniq(seq: list[str]) -> list[str]:
+                out: list[str] = []
+                for x in seq:
+                    if x and x not in out:
+                        out.append(x)
+                return out
+
+            named_u = _uniq(named)
+            if named_u:
+                self._log(f"consent action from chunks (named): {named_u[0][:16]}... n={len(named_u)}")
+                return named_u[0]
+
+            # 3) last resort: hardcoded (often stale)
+            self._log(
+                f"consent action scrape miss; fallback hardcoded {SUBMIT_OAUTH2_CONSENT_ACTION[:16]}..."
+            )
+            return SUBMIT_OAUTH2_CONSENT_ACTION
+
         def _submit_oauth2_consent(page_url: str, page_html: str = "") -> str:
             """POST Next.js submitOAuth2Consent server action; return authorization code."""
             import json as _json
 
-            action_id = SUBMIT_OAUTH2_CONSENT_ACTION
-            # Prefer live action id from page chunks if present.
-            m = re.search(r'createServerReference\)\("([a-f0-9]{40,44})"[^)]*submitOAuth2Consent', page_html)
-            if not m:
-                m = re.search(r'createServerReference\)\("([a-f0-9]{40,44})"', page_html)
-            if m:
-                action_id = m.group(1)
+            # Prefer live action id from page + JS chunks (deploy-specific).
+            action_id = _scrape_consent_action_id(page_html)
 
             # Router state tree for consent page (URL-encoded JSON).
             from urllib.parse import quote as _quote
@@ -671,6 +746,15 @@ class ProtocolOAuthClient:
                 '{"children":["consent",{"children":["__PAGE__",{}]}]}]}]}]},'
                 '"$undefined","$undefined",16]'
             )
+            # Also try to scrape router tree from page if present
+            mtree = re.search(
+                r'\[""\s*,\s*\{[^]]*?"oauth2"[^]]*?"consent"[^\]]*?\]',
+                page_html or "",
+            )
+            if mtree:
+                # keep default; full tree scrape is fragile — default works when action id is right
+                pass
+
             payload = [{
                 "action": "allow",
                 "clientId": client_id,
@@ -682,7 +766,7 @@ class ProtocolOAuthClient:
                 "nonce": nonce,
                 "principalType": "User",
                 "principalId": "",
-                "referrer": "",
+                "referrer": "grok-build",
             }]
             body = _json.dumps(payload, separators=(",", ":")).encode("utf-8")
             headers = {
@@ -696,26 +780,64 @@ class ProtocolOAuthClient:
                 "sec-fetch-mode": "cors",
                 "sec-fetch-dest": "empty",
             }
-            self._log(f"submitOAuth2Consent action={action_id[:16]}...")
-            resp = self._s.post(page_url.split("?")[0] if "consent" in page_url else page_url,
-                                headers=headers, data=body, timeout=45)
-            # Some deployments post to the consent path with query string:
-            if resp.status_code >= 400 or (resp.text and "error" in resp.text[:200].lower() and "code" not in resp.text):
-                resp = self._s.post(page_url, headers=headers, data=body, timeout=45)
-            text = resp.text or ""
-            self._log(f"consent action HTTP {resp.status_code} body={text[:180]!r}")
-            # Response may be RSC flight text containing JSON with code.
-            m = re.search(r'"code"\s*:\s*"([^"]+)"', text)
-            if m:
-                return m.group(1)
-            m = re.search(r'code=([A-Za-z0-9._~\-]+)', text)
-            if m and "error" not in m.group(0):
-                return m.group(1)
-            # Or redirect header
-            loc = resp.headers.get("location") or resp.headers.get("Location") or ""
-            if "code=" in loc:
-                return self._code_from_url(urljoin(page_url, loc), state)
-            raise RuntimeError(f"submitOAuth2Consent failed HTTP {resp.status_code}: {text[:300]}")
+            post_urls = []
+            if "consent" in page_url:
+                post_urls.append(page_url.split("?")[0])
+                post_urls.append(page_url)
+            post_urls.append(f"{ACCOUNTS_ORIGIN}/oauth2/consent")
+            # unique preserve order
+            seen_u: set[str] = set()
+            urls = []
+            for u in post_urls:
+                if u not in seen_u:
+                    seen_u.add(u)
+                    urls.append(u)
+
+            last_err = ""
+            for u in urls:
+                self._log(f"submitOAuth2Consent action={action_id[:16]}... url={u[:80]}")
+                resp = self._s.post(u, headers=headers, data=body, timeout=45)
+                text = resp.text or ""
+                self._log(f"consent action HTTP {resp.status_code} body={text[:180]!r}")
+                # Response may be RSC flight text containing JSON with code.
+                m = re.search(r'"code"\s*:\s*"([^"]+)"', text)
+                if m:
+                    return m.group(1)
+                m = re.search(r'code=([A-Za-z0-9._~\-]+)', text)
+                if m and "error" not in m.group(0):
+                    return m.group(1)
+                # Or redirect header
+                loc = resp.headers.get("location") or resp.headers.get("Location") or ""
+                if "code=" in loc:
+                    return self._code_from_url(urljoin(page_url, loc), state)
+                # success with empty/redirect via set-cookie chain in body
+                if resp.status_code in (200, 303) and "Server action not found" not in text:
+                    # follow if location without code
+                    if loc:
+                        try:
+                            return self._follow_for_code(
+                                urljoin(page_url, loc),
+                                redirect_uri=redirect_uri,
+                                state=state,
+                            )
+                        except Exception as exc:
+                            last_err = str(exc)
+                            continue
+                last_err = f"HTTP {resp.status_code}: {text[:200]}"
+                if "Server action not found" in text:
+                    # action id wrong — re-scrape once from a fresh GET of consent
+                    try:
+                        fresh = self._get(page_url, allow_redirects=False)
+                        fresh_html = fresh.text or ""
+                        new_id = _scrape_consent_action_id(fresh_html)
+                        if new_id and new_id != action_id:
+                            self._log(f"retry consent with rescraped action {new_id[:16]}...")
+                            action_id = new_id
+                            headers["next-action"] = action_id
+                            continue
+                    except Exception:
+                        pass
+            raise RuntimeError(f"submitOAuth2Consent failed: {last_err}")
 
         def _complete_via_cookie_setter(label: str) -> str:
             """Mint set-cookie chain with consent as success_url, then Allow consent."""

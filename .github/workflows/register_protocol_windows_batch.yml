@@ -1,0 +1,207 @@
+name: register-protocol-windows-batch
+
+# Parent workflow: fan-out N child Windows protocol register jobs, then summarize.
+# Each child registers per_job accounts (default 2) via register-protocol-windows.
+# Captcha: Camoufox local solver on each Windows runner.
+# Total accounts ≈ jobs × per_job (default 256 × 2 = 512).
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "How many child jobs / workflows (default 256, min 1)"
+        required: true
+        default: "256"
+      per_job:
+        description: "Accounts to register per child job (default 2)"
+        required: true
+        default: "2"
+      domains:
+        description: "Tempmail domains (comma-separated). Default: mtoosov.shop,olsbvgq.shop,htazmbb.shop,cabuhu.cn,pfdszfg.shop,tnfolpr.shop,xiiktcx.cn"
+        required: false
+        default: "mtoosov.shop,olsbvgq.shop,htazmbb.shop,cabuhu.cn,pfdszfg.shop,tnfolpr.shop,xiiktcx.cn"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      count: ${{ steps.gen.outputs.count }}
+    steps:
+      - name: Build matrix
+        id: gen
+        env:
+          COUNT: ${{ inputs.count }}
+        run: |
+          python <<'PY'
+          import json, os
+          raw = (os.environ.get("COUNT") or "256").strip()
+          try:
+              n = int(raw)
+          except Exception:
+              n = 256
+          # no hard upper cap — user-defined; floor at 1 (same as register-windows-batch)
+          n = max(1, n)
+          matrix = {"include": [{"slot": str(i)} for i in range(1, n + 1)]}
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+              f.write(f"count={n}\n")
+              f.write(f"matrix={json.dumps(matrix, separators=(',', ':'))}\n")
+          print(f"protocol-windows batch count={n}")
+          print(json.dumps(matrix, indent=2))
+          PY
+
+  register:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    uses: ./.github/workflows/register_protocol_windows.yml
+    with:
+      count: ${{ inputs.per_job || '2' }}
+      domains: ${{ inputs.domains || 'mtoosov.shop,olsbvgq.shop,htazmbb.shop,cabuhu.cn,pfdszfg.shop,tnfolpr.shop,xiiktcx.cn' }}
+      slot: ${{ matrix.slot }}
+    secrets: inherit
+
+  summarize:
+    needs: [prepare, register]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all child artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: register-protocol-windows-*
+          path: all-artifacts
+          merge-multiple: false
+
+      - name: Aggregate batch summary
+        env:
+          BATCH_COUNT: ${{ needs.prepare.outputs.count }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python <<'PY'
+          import json, os, pathlib, sys
+          root = pathlib.Path("all-artifacts")
+          metrics_list = []
+          results = []
+          upload_results = []
+          if root.exists():
+              for p in sorted(root.rglob("metrics.json")):
+                  try:
+                      metrics_list.append(json.loads(p.read_text(encoding="utf-8")))
+                  except Exception as e:
+                      print(f"skip metrics {p}: {e}")
+              for p in sorted(root.rglob("results.jsonl")):
+                  for line in p.read_text(encoding="utf-8").splitlines():
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          results.append(json.loads(line))
+                      except Exception:
+                          pass
+              for p in sorted(root.rglob("upload_result.json")):
+                  try:
+                      upload_results.append(json.loads(p.read_text(encoding="utf-8")))
+                  except Exception:
+                      pass
+
+          batch = int(os.environ.get("BATCH_COUNT") or len(metrics_list) or 0)
+          jobs_with_metrics = len(metrics_list)
+          probe_ok = sum(int(m.get("probe_ok") or 0) for m in metrics_list)
+          probe_fail = sum(int(m.get("probe_fail") or 0) for m in metrics_list)
+          reg_fail = sum(int(m.get("reg_fail") or 0) for m in metrics_list)
+          uploaded = sum(int(m.get("uploaded") or 0) for m in metrics_list)
+          upload_ok_jobs = sum(1 for m in metrics_list if m.get("upload_ok"))
+          if not metrics_list and results:
+              probe_ok = sum(
+                  1
+                  for r in results
+                  if r.get("usable") is True
+                  or r.get("status") in ("probe_ok", "upload_ok", "upload_fail")
+              )
+              reg_fail = sum(1 for r in results if r.get("status") == "reg_fail")
+              probe_fail = sum(
+                  1
+                  for r in results
+                  if r.get("status") in ("probe_fail", "build_fail") or r.get("usable") is False
+              )
+
+          success_emails = []
+          fail_rows = []
+          for m in metrics_list:
+              email = m.get("email") or "?"
+              if int(m.get("probe_ok") or 0) > 0:
+                  success_emails.append(
+                      f"- slot {m.get('slot')}: {email} status={m.get('status')} uploaded={m.get('uploaded')}"
+                  )
+              else:
+                  fail_rows.append(
+                      f"- slot {m.get('slot')}: {email} status={m.get('status') or 'fail'} "
+                      f"reg_fail={m.get('reg_fail')} probe_fail={m.get('probe_fail')}"
+                  )
+
+          per_job_raw = "${{ inputs.per_job }}" or "2"
+          try:
+              per_job = max(1, int(str(per_job_raw).strip()))
+          except Exception:
+              per_job = 2
+          expected_accounts = batch * per_job
+          summary = {
+              "engine": "protocol",
+              "runner": "windows-latest",
+              "batch_requested": batch,
+              "per_job": per_job,
+              "expected_accounts": expected_accounts,
+              "jobs_reported": jobs_with_metrics,
+              "probe_ok": probe_ok,
+              "probe_fail": probe_fail,
+              "reg_fail": reg_fail,
+              "uploaded_to_scheduler": uploaded,
+              "upload_ok_jobs": upload_ok_jobs,
+              "success_rate_jobs": round(100.0 * probe_ok / batch, 1) if batch else 0.0,
+              "success_rate_accounts": round(100.0 * probe_ok / expected_accounts, 1) if expected_accounts else 0.0,
+              "metrics": metrics_list,
+              "upload_results": upload_results,
+          }
+          pathlib.Path("batch_summary.json").write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+          )
+
+          md = [
+              "## register-protocol-windows-batch summary",
+              "- engine: **protocol** + Camoufox local solver",
+              "- runner: **windows-latest**",
+              f"- requested jobs: **{batch}** × per_job **{per_job}** ≈ **{expected_accounts}** accounts",
+              f"- jobs reported: **{jobs_with_metrics}**",
+              f"- **probe_ok (success accounts): {probe_ok}**",
+              f"- probe_fail / unusable: {probe_fail}",
+              f"- reg_fail: {reg_fail}",
+              f"- **uploaded to scheduler: {uploaded}** (jobs with upload_ok: {upload_ok_jobs})",
+              f"- success rate (accounts): **{summary['success_rate_accounts']}%**",
+              "",
+              "### Success",
+          ]
+          md.extend(success_emails or ["- (none)"])
+          md.append("")
+          md.append("### Failed / unusable")
+          md.extend(fail_rows or ["- (none)"])
+          md_text = "\n".join(md) + "\n"
+          gh_sum = os.environ.get("GITHUB_STEP_SUMMARY")
+          if gh_sum:
+              pathlib.Path(gh_sum).write_text(md_text, encoding="utf-8")
+          print(md_text)
+          print("BATCH_SUMMARY_JSON=" + json.dumps(summary, ensure_ascii=False))
+          sys.exit(0)
+          PY
+
+      - name: Upload batch summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-windows-batch-summary-${{ github.run_id }}
+          path: |
+            batch_summary.json
+            all-artifacts/
+          if-no-files-found: warn
